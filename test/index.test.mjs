@@ -18,29 +18,29 @@ async function tryLoadCordis() {
 
 const cordis = await tryLoadCordis();
 
-test('loads a valid profile and registers exactly one initialization hook', async () => {
+test('loads a valid profile and registers exactly one initialization hook', async (ctx) => {
   assert.equal(typeof name, 'string');
   if (!cordis) {
-    console.log('Cordis unavailable, skipping Cordis-dependent test');
+    ctx.skip('Cordis unavailable');
     return;
   }
-  const ctx = new cordis.Context();
+  const c = new cordis.Context();
   const plugin = { name, apply };
-  const fiber = await ctx.plugin(plugin);
+  const fiber = await c.plugin(plugin);
   assert.equal(fiber.state, 2 /* ACTIVE */);
   const effects = fiber.getEffects();
   assert.equal(effects.length, 1);
   await fiber.dispose();
 });
 
-test('shutdown releases every resource owned by the plugin', async () => {
+test('shutdown releases every resource owned by the plugin', async (ctx) => {
   if (!cordis) {
-    console.log('Cordis unavailable, skipping Cordis-dependent test');
+    ctx.skip('Cordis unavailable');
     return;
   }
-  const ctx = new cordis.Context();
+  const c = new cordis.Context();
   const plugin = { name, apply };
-  const fiber = await ctx.plugin(plugin);
+  const fiber = await c.plugin(plugin);
   assert.equal(fiber.state, 2 /* ACTIVE */);
   await assert.doesNotReject(async () => await fiber.dispose());
 });
