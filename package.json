@@ -1,0 +1,12 @@
+{
+  "name": "dsh-change-control",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": "./src/index.js",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build": "echo 'ESM package, no build step required'",
+    "typecheck": "echo 'Plain JavaScript implementation, no TypeScript'"
+  }
+}
