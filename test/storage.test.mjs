@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ChangeStore } from '../src/storage/change-store.js';
@@ -213,6 +213,118 @@ test('canonicalizes file paths so relative and absolute paths target the same st
     // Both should have exactly 2 events (DRAFT + PLANNED)
     assert.equal(histAbs.length, 2);
     assert.equal(histRel.length, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// AC (repair-round-2): Multiple REVIEW->REPAIR->PREFLIGHT->REVIEW cycles;
+// history length equals number of successful mutations; reopen state matches.
+test('REVIEW-REPAIR-PREFLIGHT-REVIEW cycles preserve history count and state across reopen', () => withStore(async (file) => {
+  const store = await ChangeStore.open(file);
+  const created = await store.create(input('Cycle test'));
+  // Drive to REVIEW state
+  await store.transition(created.id, 'PLANNED');
+  await store.transition(created.id, 'READY');
+  await store.transition(created.id, 'IMPLEMENTING');
+  await store.transition(created.id, 'PREFLIGHT');
+  await store.transition(created.id, 'REVIEW');
+
+  const beforeReopen = snapshot(await store.get(created.id));
+  assert.equal(beforeReopen.state, 'REVIEW');
+  const historyBefore = await store.history(created.id);
+  // DRAFT + PLANNED + READY + IMPLEMENTING + PREFLIGHT + REVIEW = 6 events
+  assert.equal(historyBefore.length, 6);
+
+  // Two full REVIEW->REPAIR->PREFLIGHT->REVIEW cycles = 6 more transitions
+  await store.transition(created.id, 'REPAIR');
+  await store.transition(created.id, 'PREFLIGHT');
+  await store.transition(created.id, 'REVIEW');
+  await store.transition(created.id, 'REPAIR');
+  await store.transition(created.id, 'PREFLIGHT');
+  await store.transition(created.id, 'REVIEW');
+
+  const historyAfter = await store.history(created.id);
+  // 6 initial + 6 cycle transitions = 12 events
+  assert.equal(historyAfter.length, 12);
+
+  // Capture expected state after all transitions (before reopen)
+  const expectedAfter = snapshot(await store.get(created.id));
+  assert.equal(expectedAfter.state, 'REVIEW');
+
+  // Reopen and verify state and history are preserved
+  const store2 = await ChangeStore.open(file);
+  const afterReopen = snapshot(await store2.get(created.id));
+  assert.deepEqual(afterReopen, expectedAfter);
+  const historyReopened = await store2.history(created.id);
+  assert.equal(historyReopened.length, 12);
+}));
+
+// AC (repair-round-3): Simulate cross-process restart by resetting the module counter,
+// writing a new event, and asserting no committed events are dropped and state is preserved.
+test('cross-process restart preserves all audit events and state', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-restart-'));
+  try {
+    const file = join(dir, 'changes.json');
+
+    // First process: create a change and drive it through several transitions
+    const store1 = await ChangeStore.open(file);
+    const created = await store1.create(input('Restart test'));
+    await store1.transition(created.id, 'PLANNED');
+    await store1.transition(created.id, 'READY');
+    await store1.transition(created.id, 'IMPLEMENTING');
+
+    const stateBefore = snapshot(await store1.get(created.id));
+    const historyBefore = await store1.history(created.id);
+    assert.equal(historyBefore.length, 4); // DRAFT + 3 transitions
+    assert.equal(stateBefore.state, 'IMPLEMENTING');
+
+    // Simulate a second "process" by creating a fresh store instance
+    // The module-level eventIdSeq persists in-process, but we also test
+    // the disk-seeding path by opening a brand-new node process via spawn
+    const { spawn } = await import('node:child_process');
+    const storePath = new URL('../src/storage/change-store.js', import.meta.url).href;
+    const script = `
+      import { ChangeStore } from '${storePath}';
+      const store = await ChangeStore.open(process.env.DATA_FILE);
+      const c = await store.get('${created.id}');
+      const transitioned = await store.transition(c.id, 'PREFLIGHT');
+      const h = await store.history('${created.id}');
+      console.log(JSON.stringify({ state: transitioned.state, historyLength: h.length }));
+    `;
+    const scriptFile = join(dir, 'write.js');
+    await writeFile(scriptFile, script, 'utf8');
+
+    const proc = spawn(process.execPath, [scriptFile, file], {
+      env: { ...process.env, DATA_FILE: file, NODE_PATH: undefined },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const stdout = await new Promise((resolve) => {
+      let out = '';
+      proc.stdout.on('data', (d) => { out += d; });
+      proc.stderr.on('data', (d) => { console.error(d.toString()); });
+      proc.on('close', () => resolve(out.trim()));
+    });
+
+    assert.equal(proc.exitCode, 0, `second process failed: ${stdout}`);
+    const result = JSON.parse(stdout);
+    assert.equal(result.historyLength, 5); // 4 previous + 1 new
+    assert.equal(result.state, 'PREFLIGHT');
+
+    // Reopen in this process and verify everything is preserved
+    const store2 = await ChangeStore.open(file);
+    const afterReopen = snapshot(await store2.get(created.id));
+    assert.equal(afterReopen.state, 'PREFLIGHT');
+    const historyAfter = await store2.history(created.id);
+    assert.equal(historyAfter.length, 5);
+    assert.deepEqual(historyAfter.map((e) => ({ changeId: e.changeId, from: e.from, to: e.to })), [
+      { changeId: created.id, from: null, to: 'DRAFT' },
+      { changeId: created.id, from: 'DRAFT', to: 'PLANNED' },
+      { changeId: created.id, from: 'PLANNED', to: 'READY' },
+      { changeId: created.id, from: 'READY', to: 'IMPLEMENTING' },
+      { changeId: created.id, from: 'IMPLEMENTING', to: 'PREFLIGHT' },
+    ]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

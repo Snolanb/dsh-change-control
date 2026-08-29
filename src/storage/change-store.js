@@ -12,6 +12,8 @@ import { resolve } from 'node:path';
 import { createChange, ChangeDomainError } from '../domain/change.js';
 
 const writeLocks = new Map();
+/** Monotonic counter for collision-free event IDs. Seeded from disk on load. */
+let eventIdSeq = 0;
 
 /** Canonicalize file path to absolute form for consistent lock/key identity. */
 function canonicalPath(file) {
@@ -52,6 +54,25 @@ function writeJson(file, data) {
     });
 }
 
+/**
+ * Generate a collision-free event ID, seeded from disk on load so restarts
+ * don't produce IDs that collide with already-persisted events.
+ */
+function nextEventId() {
+  return ++eventIdSeq;
+}
+
+/**
+ * Seed the event ID counter from persisted audit events on disk.
+ * Must be called under the write lock to avoid races.
+ */
+function seedEventIdFromDisk(data) {
+  if (data && Array.isArray(data.audit) && data.audit.length > 0) {
+    const maxId = Math.max(...data.audit.map((e) => e.eventId ?? 0));
+    if (maxId > eventIdSeq) eventIdSeq = maxId;
+  }
+}
+
 function rehydrate(serialized, events) {
   const c = createChange({
     title: serialized.title,
@@ -68,6 +89,28 @@ function rehydrate(serialized, events) {
   const last = events[events.length - 1];
   if (last) c.updatedAt = last.ts;
   return c;
+}
+
+/**
+ * Return a frozen plain-object projection of a Change.
+ * Strips private #state and prevents callers from mutating stored state
+ * or reaching transitionTo() on the live stored object.
+ */
+function freezeChange(c) {
+  const proj = {
+    id: c.id,
+    title: c.title,
+    objective: c.objective,
+    acceptanceCriteria: [...c.acceptanceCriteria],
+    risk: c.risk,
+    acceptedPlanId: c.acceptedPlanId,
+    state: c.state,
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+  };
+  Object.freeze(proj.acceptanceCriteria);
+  Object.freeze(proj);
+  return proj;
 }
 
 export class ChangeStore {
@@ -95,6 +138,8 @@ export class ChangeStore {
       return;
     }
     if (!data) return;
+    // Seed event ID counter from persisted events to avoid collisions after restart
+    seedEventIdFromDisk(data);
     const idx = new Map();
     for (const e of (Array.isArray(data.audit) ? data.audit : [])) {
       if (!idx.has(e.changeId)) idx.set(e.changeId, []);
@@ -106,10 +151,6 @@ export class ChangeStore {
     this.#audit = Array.isArray(data.audit) ? data.audit : [];
   }
 
-  /**
-   * Refresh this store's view of a specific change from disk and merge back.
-   * Called before transition to detect stale in-memory state.
-   */
   async #refreshChange(id) {
     let data;
     try {
@@ -118,6 +159,8 @@ export class ChangeStore {
       return;
     }
     if (!data) return;
+    // Re-seed counter from latest disk state
+    seedEventIdFromDisk(data);
     const idx = new Map();
     for (const e of (Array.isArray(data.audit) ? data.audit : [])) {
       if (!idx.has(e.changeId)) idx.set(e.changeId, []);
@@ -126,7 +169,6 @@ export class ChangeStore {
     const diskChanges = data.changes ?? [];
     const diskAudit = Array.isArray(data.audit) ? data.audit : [];
 
-    // Rebuild our entire state from disk to ensure consistency
     this.#changes = new Map(
       diskChanges.map((c) => [c.id, rehydrate(c, idx.get(c.id) ?? [])])
     );
@@ -135,10 +177,6 @@ export class ChangeStore {
     return this.#changes.get(id);
   }
 
-  /**
-   * Read current disk state, merge in any local mutations, and persist.
-   * The write lock ensures this is atomic per file.
-   */
   async #persist() {
     let diskData;
     try {
@@ -163,11 +201,11 @@ export class ChangeStore {
       updatedAt: c.updatedAt,
     });
 
-    // Merge audit: disk events + our local new events (dedup by ts+changeId+to)
-    const diskEventIds = new Set(diskAudit.map((e) => e.ts + e.changeId + e.to));
+    // Merge audit: disk events + our local new events (dedup by eventId)
+    const diskEventIds = new Set(diskAudit.map((e) => e.eventId));
     const mergedAudit = [
       ...diskAudit,
-      ...this.#audit.filter((e) => !diskEventIds.has(e.ts + e.changeId + e.to)),
+      ...this.#audit.filter((e) => !diskEventIds.has(e.eventId)),
     ];
 
     await writeJson(this.#file, { changes: [...mergedChanges.values()], audit: mergedAudit });
@@ -178,9 +216,15 @@ export class ChangeStore {
     try {
       const change = createChange(input);
       this.#changes.set(change.id, change);
-      this.#audit.push({ changeId: change.id, from: null, to: 'DRAFT', ts: change.createdAt });
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId: change.id,
+        from: null,
+        to: 'DRAFT',
+        ts: change.createdAt,
+      });
       await this.#persist();
-      return change;
+      return freezeChange(change);
     } finally {
       release();
     }
@@ -191,7 +235,7 @@ export class ChangeStore {
     try {
       const c = this.#changes.get(id);
       if (!c) throw Object.assign(new Error(`Change ${id} not found`), { code: 'NOT_FOUND' });
-      return c;
+      return freezeChange(c);
     } finally {
       release();
     }
@@ -211,9 +255,15 @@ export class ChangeStore {
         if (err instanceof ChangeDomainError) throw err;
         throw err;
       }
-      this.#audit.push({ changeId: id, from: before, to: nextState, ts: c.updatedAt });
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId: id,
+        from: before,
+        to: nextState,
+        ts: c.updatedAt,
+      });
       await this.#persist();
-      return c;
+      return freezeChange(c);
     } finally {
       release();
     }
