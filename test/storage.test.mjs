@@ -329,3 +329,74 @@ test('cross-process restart preserves all audit events and state', async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// AC (BLOCKER-6): Stale store creates a new change after another process writes;
+// the creation event must persist (no eventId collision loss).
+test('stale store create after cross-process writes preserves creation event', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-stale-'));
+  try {
+    const file = join(dir, 'changes.json');
+
+    // Store A opens and creates a change
+    const storeA = await ChangeStore.open(file);
+    const changeA = await storeA.create(input('Store A change'));
+    await storeA.transition(changeA.id, 'PLANNED');
+
+    // A separate process appends events (simulating another writer)
+    const { spawn } = await import('node:child_process');
+    const storePath = new URL('../src/storage/change-store.js', import.meta.url).href;
+    const script = `
+      import { ChangeStore } from '${storePath}';
+      const store = await ChangeStore.open(process.env.DATA_FILE);
+      const c = await store.get('${changeA.id}');
+      await store.transition(c.id, 'READY');
+      const c2 = await store.create({title:'Process B change',objective:'',acceptanceCriteria:[],risk:'normal'});
+      await store.transition(c2.id, 'PLANNED');
+      console.log(JSON.stringify({ readyDone: true, bId: c2.id }));
+    `;
+    const scriptFile = join(dir, 'write.js');
+    await writeFile(scriptFile, script, 'utf8');
+
+    const proc = spawn(process.execPath, [scriptFile], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, DATA_FILE: file },
+    });
+    const stdout = await new Promise((resolve) => {
+      let out = '';
+      proc.stdout.on('data', (d) => { out += d; });
+      proc.on('close', () => resolve(out.trim()));
+    });
+    assert.equal(proc.exitCode, 0, `second process failed: ${stdout}`);
+    const spawnResult = JSON.parse(stdout);
+    assert.equal(spawnResult.readyDone, true);
+    assert.ok(spawnResult.bId);
+
+    // Store A (now stale) creates another change
+    const changeB = await storeA.create(input('Store A stale create'));
+    await storeA.transition(changeB.id, 'PLANNED');
+
+    // Reopen fresh and verify:
+    // - changeA has 3 events (DRAFT, PLANNED, READY)
+    // - changeB has 2 events (DRAFT, PLANNED)
+    // - Process B's change has 2 events (DRAFT, PLANNED)
+    const storeFresh = await ChangeStore.open(file);
+    const histA = await storeFresh.history(changeA.id);
+    const histB = await storeFresh.history(changeB.id);
+    const histSpawnB = await storeFresh.history(spawnResult.bId);
+
+    assert.equal(histA.length, 3, 'changeA should have 3 events');
+    assert.equal(histB.length, 2, 'changeB (from stale store) should have 2 events');
+    assert.equal(histSpawnB.length, 2, "spawn B's change should have 2 events");
+    assert.equal((await storeFresh.get(changeA.id)).state, 'READY');
+    assert.equal((await storeFresh.get(changeB.id)).state, 'PLANNED');
+    assert.equal((await storeFresh.get(spawnResult.bId)).state, 'PLANNED');
+
+    // Total audit events = 3 + 2 + 2 = 7
+    const allAudit = await storeFresh.history(changeA.id);
+    const allB = await storeFresh.history(changeB.id);
+    const allSpawn = await storeFresh.history(spawnResult.bId);
+    assert.equal(allAudit.length + allB.length + allSpawn.length, 7);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

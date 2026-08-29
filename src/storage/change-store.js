@@ -63,10 +63,16 @@ function nextEventId() {
 }
 
 /**
- * Seed the event ID counter from persisted audit events on disk.
- * Must be called under the write lock to avoid races.
+ * Reseed the event ID counter from freshly read durable disk state.
+ * Must be called under the per-file write lock, right before assigning an eventId.
  */
-function seedEventIdFromDisk(data) {
+async function reseedFromDisk(file) {
+  let data;
+  try {
+    data = await readJson(file);
+  } catch {
+    return;
+  }
   if (data && Array.isArray(data.audit) && data.audit.length > 0) {
     const maxId = Math.max(...data.audit.map((e) => e.eventId ?? 0));
     if (maxId > eventIdSeq) eventIdSeq = maxId;
@@ -139,7 +145,8 @@ export class ChangeStore {
     }
     if (!data) return;
     // Seed event ID counter from persisted events to avoid collisions after restart
-    seedEventIdFromDisk(data);
+    const maxId = Math.max(...(data.audit ?? []).map((e) => e.eventId ?? 0), 0);
+    if (maxId > eventIdSeq) eventIdSeq = maxId;
     const idx = new Map();
     for (const e of (Array.isArray(data.audit) ? data.audit : [])) {
       if (!idx.has(e.changeId)) idx.set(e.changeId, []);
@@ -151,6 +158,10 @@ export class ChangeStore {
     this.#audit = Array.isArray(data.audit) ? data.audit : [];
   }
 
+  /**
+   * Refresh this store's view of a specific change from disk.
+   * Only updates #changes (not #audit) so local audit mutations are preserved.
+   */
   async #refreshChange(id) {
     let data;
     try {
@@ -160,20 +171,19 @@ export class ChangeStore {
     }
     if (!data) return;
     // Re-seed counter from latest disk state
-    seedEventIdFromDisk(data);
+    const maxId = Math.max(...(data.audit ?? []).map((e) => e.eventId ?? 0), 0);
+    if (maxId > eventIdSeq) eventIdSeq = maxId;
     const idx = new Map();
     for (const e of (Array.isArray(data.audit) ? data.audit : [])) {
       if (!idx.has(e.changeId)) idx.set(e.changeId, []);
       idx.get(e.changeId).push(e);
     }
     const diskChanges = data.changes ?? [];
-    const diskAudit = Array.isArray(data.audit) ? data.audit : [];
-
     this.#changes = new Map(
       diskChanges.map((c) => [c.id, rehydrate(c, idx.get(c.id) ?? [])])
     );
-    this.#audit = diskAudit;
-
+    // NOTE: we do NOT replace this.#audit here — local audit entries are
+    // merged in #persist() via eventId dedup, preserving uncommitted events.
     return this.#changes.get(id);
   }
 
@@ -216,6 +226,9 @@ export class ChangeStore {
     try {
       const change = createChange(input);
       this.#changes.set(change.id, change);
+      // Reseed from disk under lock immediately before assigning eventId,
+      // so concurrent process writes are visible and no collision occurs.
+      await reseedFromDisk(this.#file);
       this.#audit.push({
         eventId: nextEventId(),
         changeId: change.id,
@@ -244,7 +257,7 @@ export class ChangeStore {
   async transition(id, nextState) {
     const release = await acquireLock(this.#file);
     try {
-      // Refresh from disk to reconcile any concurrent writes before validating
+      // Refresh the change entity from disk (but preserve local audit entries)
       await this.#refreshChange(id);
       const c = this.#changes.get(id);
       if (!c) throw Object.assign(new Error(`Change ${id} not found`), { code: 'NOT_FOUND' });
@@ -255,6 +268,8 @@ export class ChangeStore {
         if (err instanceof ChangeDomainError) throw err;
         throw err;
       }
+      // Reseed from disk under lock immediately before assigning eventId
+      await reseedFromDisk(this.#file);
       this.#audit.push({
         eventId: nextEventId(),
         changeId: id,
