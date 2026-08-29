@@ -7,6 +7,10 @@
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "build": "echo 'ESM package, no build step required'",
-    "typecheck": "echo 'Plain JavaScript implementation, no TypeScript'"
+    "typecheck": "NPM_CONFIG_CACHE=/tmp/npm-cache npx --cache /tmp/npm-npx-cache typescript@latest --noEmit --strict --module ESNext --moduleResolution bundler --target ES2022 --esModuleInterop --skipLibCheck src/index.ts"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "file:/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis",
+    "typescript": "^5.7.3"
   }
 }
