@@ -1,0 +1,16 @@
+{
+  "name": "dsh-change-control",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": "./src/index.js",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build": "echo 'ESM package, no build step required'",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "typescript": "^5.7.3"
+  }
+}
