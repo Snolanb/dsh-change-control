@@ -1,12 +1,11 @@
 const name = 'dsh-change-control';
 
 function apply(ctx, config) {
-  ctx.onInit(() => {
+  ctx.effect(() => {
     // Initialization logic runs exactly once per context
-  });
-
-  ctx.onShutdown(() => {
-    // Cleanup logic - releases all owned resources
+    return () => {
+      // Cleanup logic - releases all owned resources
+    };
   });
 }
 
