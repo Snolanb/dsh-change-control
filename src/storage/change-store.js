@@ -321,18 +321,14 @@ export class ChangeStore {
       }
     }
 
-    // Merge bindings: union by (changeId, sessionId), prefer local when this instance mutated it.
+    // Merge bindings: union by (changeId, sessionId), local is authoritative under lock.
     const diskBindings = Array.isArray(diskData?.bindings) ? diskData.bindings : [];
     const mergedBindings = new Map();
     for (const b of diskBindings) mergedBindings.set(`${b.changeId}:${b.sessionId}`, b);
     for (const b of [...this.#bindings.values()].flat()) {
       const key = `${b.changeId}:${b.sessionId}`;
-      const diskRec = mergedBindings.get(key);
-      // Prefer local binding if this store has local uncommitted events for this change
-      const hasLocalEvents = this.#audit.some((e) => e.changeId === b.changeId && !diskEventIds.has(e.eventId));
-      if (hasLocalEvents || !diskRec) {
-        mergedBindings.set(key, b);
-      }
+      // Local binding is authoritative: always overwrite with local value.
+      mergedBindings.set(key, b);
     }
 
     // Merge attempts: union by attemptId, prefer local.
@@ -683,6 +679,7 @@ export class ChangeStore {
   async resolveRole(changeId, sessionId) {
     const release = await acquireLock(this.#file);
     try {
+      await this.#refreshBindingsAndAttempts();
       const binding = (this.#bindings.get(changeId) ?? []).find(
         (b) => b.changeId === changeId && b.sessionId === sessionId
       );
@@ -699,6 +696,7 @@ export class ChangeStore {
   async listRoleBindings() {
     const release = await acquireLock(this.#file);
     try {
+      await this.#refreshBindingsAndAttempts();
       return structuredClone([...this.#bindings.values()].flat());
     } finally {
       release();
@@ -734,6 +732,7 @@ export class ChangeStore {
   async listAttempts(changeId) {
     const release = await acquireLock(this.#file);
     try {
+      await this.#refreshBindingsAndAttempts();
       return structuredClone(this.#attempts.get(changeId) ?? []);
     } finally {
       release();

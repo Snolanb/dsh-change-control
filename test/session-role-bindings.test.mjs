@@ -127,6 +127,74 @@ test('bindings and attempts merge correctly across concurrent stores', () => wit
   assert.equal(attemptsB.length, 1);
 }));
 
+// Regression: two stores opened before the write, both should see the binding/attempts.
+test('two stores opened before write both see bindings and attempts after commit', () => withStore(async (file) => {
+  const [storeA, storeB] = await Promise.all([
+    ChangeStore.open(file),
+    ChangeStore.open(file),
+  ]);
+
+  const change = await storeA.create(input);
+
+  // Both stores bind a role
+  await storeA.bindRole(change.id, 'session-a', 'implementer');
+  await storeB.bindRole(change.id, 'session-b', 'reviewer');
+
+  // Both stores record attempts
+  await storeA.recordAttempt(change.id, {
+    attemptId: 'attempt-a',
+    workerId: 'worker-a',
+    status: 'running',
+  });
+  await storeB.recordAttempt(change.id, {
+    attemptId: 'attempt-b',
+    workerId: 'worker-b',
+    status: 'done',
+  });
+
+  // Fresh store should see both bindings and attempts
+  const storeC = await ChangeStore.open(file);
+  const bindings = await storeC.listRoleBindings();
+  const attempts = await storeC.listAttempts(change.id);
+  assert.equal(bindings.length, 2);
+  assert.ok(bindings.some((b) => b.sessionId === 'session-a' && b.role === 'implementer'));
+  assert.ok(bindings.some((b) => b.sessionId === 'session-b' && b.role === 'reviewer'));
+  assert.equal(attempts.length, 2);
+  assert.ok(attempts.some((a) => a.attemptId === 'attempt-a'));
+  assert.ok(attempts.some((a) => a.attemptId === 'attempt-b'));
+}));
+
+// Regression: long-lived reader sees rebind from another store.
+test('long-lived reader sees external rebind via resolveRole', () => withStore(async (file) => {
+  const [storeA, storeB] = await Promise.all([
+    ChangeStore.open(file),
+    ChangeStore.open(file),
+  ]);
+
+  const change = await storeA.create(input);
+
+  // Store A binds session-a to implementer
+  await storeA.bindRole(change.id, 'session-a', 'implementer');
+
+  // Store B does an unrelated create (triggers persist that merges storeA's data)
+  await storeB.create({ title: 'Other', objective: '', acceptanceCriteria: [], risk: 'normal' });
+
+  // Store A explicitly rebinds session-a to reviewer
+  await storeA.bindRole(change.id, 'session-a', 'reviewer', { rebind: true });
+
+  // Store B should now see the rebind when it calls resolveRole
+  assert.equal(await storeB.resolveRole(change.id, 'session-a'), 'reviewer');
+
+  // Store B's listRoleBindings should also show the new role
+  const bindingsB = await storeB.listRoleBindings();
+  assert.equal(bindingsB.length, 1);
+  assert.equal(bindingsB[0].sessionId, 'session-a');
+  assert.equal(bindingsB[0].role, 'reviewer');
+
+  // Store A should still have the correct role
+  assert.equal(await storeA.resolveRole(change.id, 'session-a'), 'reviewer');
+}));
+
 // Regression: store A binds a role and records an attempt, store B does unrelated create,
 // then a freshly opened store resolves the role and lists the attempt.
 test('binds and attempts persist across unrelated concurrent operations', () => withStore(async (file) => {
@@ -159,4 +227,24 @@ test('binds and attempts persist across unrelated concurrent operations', () => 
   assert.equal(attempts[0].attemptId, 'attempt-1');
   const bindings = await storeC.listRoleBindings();
   assert.equal(bindings.length, 2);
+}));
+
+// Regression: rebind persists and resolves correctly after reopen.
+test('rebind role persists and resolves after store reopen', () => withStore(async (file) => {
+  const store = await ChangeStore.open(file);
+  const change = await store.create(input);
+
+  // Bind session-a to implementer
+  await store.bindRole(change.id, 'session-a', 'implementer');
+  assert.equal(await store.resolveRole(change.id, 'session-a'), 'implementer');
+
+  // Rebind session-a to reviewer
+  await store.bindRole(change.id, 'session-a', 'reviewer', { rebind: true });
+
+  // Reopen and verify new role resolves
+  const reopened = await ChangeStore.open(file);
+  assert.equal(await reopened.resolveRole(change.id, 'session-a'), 'reviewer');
+  const bindings = await reopened.listRoleBindings();
+  assert.equal(bindings.length, 1);
+  assert.equal(bindings[0].role, 'reviewer');
 }));
