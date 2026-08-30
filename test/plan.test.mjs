@@ -142,3 +142,122 @@ test('second ChangeStore instance sees plans submitted by first instance', async
   assert.equal(cBAccepted.state, 'READY');
   assert.equal(cBAccepted.acceptedPlanId, plan2.id);
 });
+
+test('accepted change can transition to IMPLEMENTING and persists across reopen', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-plan-b1-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'changes.json');
+  const store = await ChangeStore.open(file);
+  const change = await store.create({ title: 'B1 accept-then-transition' });
+  const plan = await store.submitPlan(change.id, firstPlan);
+  await store.acceptPlan(change.id, plan.id, { authorized: true });
+
+  // B1: accepted change must transition READY→IMPLEMENTING
+  const implementing = await store.transition(change.id, 'IMPLEMENTING');
+  assert.equal(implementing.state, 'IMPLEMENTING');
+
+  // B1: must persist across reopen
+  const store2 = await ChangeStore.open(file);
+  const c2 = await store2.get(change.id);
+  assert.equal(c2.state, 'IMPLEMENTING');
+});
+
+test('illegal READY→PLANNED without a plan rejects and emits no bogus event', async (t) => {
+  const { store, change } = await withChange(t);
+
+  // Drive to READY via domain transitions only (no plans)
+  await store.transition(change.id, 'PLANNED');
+  await store.transition(change.id, 'READY');
+
+  const beforeHistory = (await store.history(change.id)).length;
+
+  // Direct READY→PLANNED via domain transition must reject
+  await assert.rejects(
+    store.transition(change.id, 'PLANNED'),
+    /Cannot transition from READY to PLANNED/,
+  );
+
+  // No bogus audit event emitted
+  const afterHistory = (await store.history(change.id)).length;
+  assert.equal(afterHistory, beforeHistory);
+});
+
+test('stale writer does not erase on-disk plans', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-plan-b3-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'changes.json');
+
+  // Store A submits and accepts a plan
+  const storeA = await ChangeStore.open(file);
+  const change = await storeA.create({ title: 'B3 stale' });
+  const plan1 = await storeA.submitPlan(change.id, firstPlan);
+  await storeA.acceptPlan(change.id, plan1.id, { authorized: true });
+
+  // Store B (fresh) submits another plan
+  const storeB = await ChangeStore.open(file);
+  const plan2 = await storeB.submitPlan(change.id, { ...firstPlan, objective: 'B3 v2' });
+  assert.equal(plan2.status, 'PLANNED');
+
+  // Store A (stale, no plan snapshot) creates a new change and persists
+  const changeA2 = await storeA.create({ title: 'Stale A change' });
+  await storeA.transition(changeA2.id, 'PLANNED');
+
+  // Reopen fresh: plan2 must still exist
+  const storeC = await ChangeStore.open(file);
+  const revisions = await storeC.listPlans(change.id);
+  assert.equal(revisions.length, 2);
+  assert.equal(revisions.find((p) => p.id === plan2.id)?.status, 'PLANNED');
+});
+
+test('superseded plan cannot be modified', async (t) => {
+  const { store, change } = await withChange(t);
+  const first = await store.submitPlan(change.id, firstPlan);
+  await store.acceptPlan(change.id, first.id, { authorized: true });
+  await store.submitPlan(change.id, { ...firstPlan, objective: 'Revised' });
+
+  // SUPERSEDED plan must reject modification
+  await assert.rejects(
+    store.updatePlan(first.id, { ...firstPlan, objective: 'Tampered' }),
+    /SUPERSEDED|only PLANNED/,
+  );
+});
+
+test('returned plan objects are immutable clones', async (t) => {
+  const { store, change } = await withChange(t);
+  const plan = await store.submitPlan(change.id, firstPlan);
+
+  // Mutating the returned plan must not affect stored state
+  plan.status = 'TAMPERED';
+  plan.content = { objective: 'Hacked', steps: [] };
+
+  const fresh = await store.getPlan(plan.id);
+  assert.equal(fresh.status, 'PLANNED');
+  assert.deepEqual(fresh.content, firstPlan);
+});
+
+test('acceptPlan defaults to unauthorized', async (t) => {
+  const { store, change } = await withChange(t);
+  const plan = await store.submitPlan(change.id, firstPlan);
+
+  // No authorized flag → FORBIDDEN
+  await assert.rejects(
+    store.acceptPlan(change.id, plan.id),
+    /FORBIDDEN|Not authorized/,
+  );
+});
+
+test('acceptPlan rejects non-current revision', async (t) => {
+  const { store, change } = await withChange(t);
+  const first = await store.submitPlan(change.id, firstPlan);
+  const second = await store.submitPlan(change.id, { ...firstPlan, objective: 'v2' });
+
+  // Trying to accept the older (non-current) plan must reject
+  await assert.rejects(
+    store.acceptPlan(change.id, first.id, { authorized: true }),
+    /non-current|No current/,
+  );
+
+  // Current plan still accepts
+  const accepted = await store.acceptPlan(change.id, second.id, { authorized: true });
+  assert.equal(accepted.status, 'ACCEPTED');
+});

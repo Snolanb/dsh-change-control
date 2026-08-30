@@ -9,7 +9,7 @@
 // @ts-nocheck
 import { readFile, writeFile, rename, unlink } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { createChange, ChangeDomainError } from '../domain/change.js';
+import { createChange, ChangeDomainError, TRANSITIONS } from '../domain/change.js';
 
 const writeLocks = new Map();
 /** Monotonic counter for collision-free event IDs. Seeded from disk on load. */
@@ -89,16 +89,30 @@ function rehydrate(serialized, events) {
   c.id = serialized.id;
   c.createdAt = serialized.createdAt;
   c.acceptedPlanId = serialized.acceptedPlanId;
-  // Replay only domain-transition events (skip plan-lifecycle events which have planId).
+  // If the serialized record carries an explicit domain state, use it directly
+  // and skip audit replay. This avoids gaps caused by plan-lifecycle events
+  // (DRAFT→PLANNED, PLANNED→READY, READY→PLANNED) that carry planId and are
+  // not legal domain transitions from the domain's perspective.
+  if (serialized.domainState) {
+    c._setDomainState(serialized.domainState);
+    if (serialized.planState) {
+      c._setPlanState(serialized.planState);
+    }
+    const last = events[events.length - 1];
+    if (last) c.updatedAt = last.ts;
+    return c;
+  }
+
+  // Normal path: replay only pure domain transitions (no planId).
   for (const e of events) {
     if (e.planId != null) continue;
     if (e.from !== null) c.transitionTo(e.to);
   }
-  // Apply any plan-lifecycle state override persisted on the change record.
+  // Apply plan-lifecycle state override.
   if (serialized.planState) {
     c._setPlanState(serialized.planState);
   }
-  const last = events.filter((e) => e.planId == null)[events.filter((e) => e.planId == null).length - 1];
+  const last = events[events.length - 1];
   if (last) c.updatedAt = last.ts;
   return c;
 }
@@ -212,36 +226,63 @@ export class ChangeStore {
     }
     const diskChanges = diskData?.changes ?? [];
     const diskAudit = Array.isArray(diskData?.audit) ? diskData.audit : [];
+    const diskEventIds = new Set(diskAudit.map((e) => e.eventId));
 
-    // Merge: start from disk, overlay our local changes (by id)
+    // Merge: start from disk, overlay our local changes (by id).
+    // Only overwrite state fields (domainState, planState) if this store
+    // has local uncommitted audit events for this change — otherwise keep
+    // disk values to avoid stale-writer erosion (B3).
     const mergedChanges = new Map();
     for (const c of diskChanges) mergedChanges.set(c.id, c);
     for (const [id, c] of this.#changes) {
-      mergedChanges.set(id, {
-        id: c.id,
-        title: c.title,
-        objective: c.objective,
-        acceptanceCriteria: c.acceptanceCriteria,
-        risk: c.risk,
-        acceptedPlanId: c.acceptedPlanId,
-        planState: c._getPlanState?.() ?? null,
-        createdAt: c.createdAt,
-        updatedAt: c.updatedAt,
-      });
+      const diskRec = mergedChanges.get(id);
+      // Check if we have local audit events for this change that aren't on disk
+      const hasLocalEvents = this.#audit.some((e) => e.changeId === id && !diskEventIds.has(e.eventId));
+      if (hasLocalEvents) {
+        mergedChanges.set(id, {
+          id: c.id,
+          title: c.title,
+          objective: c.objective,
+          acceptanceCriteria: c.acceptanceCriteria,
+          risk: c.risk,
+          acceptedPlanId: c.acceptedPlanId,
+          planState: c._getPlanState?.() ?? null,
+          domainState: c._getDomainState?.() ?? c.state,
+          createdAt: c.createdAt,
+          updatedAt: c.updatedAt,
+        });
+      } else if (diskRec) {
+        // Preserve disk state fields; only overlay mutable scalar fields
+        mergedChanges.set(id, {
+          ...diskRec,
+          title: c.title,
+          objective: c.objective,
+          acceptanceCriteria: c.acceptanceCriteria,
+          risk: c.risk,
+          acceptedPlanId: c.acceptedPlanId,
+          updatedAt: c.updatedAt,
+        });
+      }
     }
 
     // Merge audit: disk events + our local new events (dedup by eventId)
-    const diskEventIds = new Set(diskAudit.map((e) => e.eventId));
     const mergedAudit = [
       ...diskAudit,
       ...this.#audit.filter((e) => !diskEventIds.has(e.eventId)),
     ];
 
+    // Merge plans: start from disk, overlay our local plans (by id).
+    // This prevents a stale writer with no plan snapshot from wiping on-disk plans.
+    const diskPlans = Array.isArray(diskData?.plans) ? diskData.plans : [];
+    const mergedPlans = new Map();
+    for (const p of diskPlans) mergedPlans.set(p.id, p);
+    for (const p of this.#plans ?? []) mergedPlans.set(p.id, p);
+
     await writeJson(this.#file, {
       changes: [...mergedChanges.values()],
       audit: mergedAudit,
       // Plans are kept as a top-level array for direct retrieval.
-      plans: this.#plans,
+      plans: [...mergedPlans.values()],
     });
   }
 
@@ -324,8 +365,11 @@ export class ChangeStore {
    * @param {object} content
    * @returns {Promise<string>}
    */
+  /**
+   * Compute a stable content digest (SHA-256 hex) with deterministic key ordering.
+   */
   async #digest(content) {
-    const bytes = new TextEncoder().encode(JSON.stringify(content));
+    const bytes = new TextEncoder().encode(JSON.stringify(content, Object.keys(content).sort()));
     const hash = await crypto.subtle.digest('SHA-256', bytes);
     return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, '0')).join('');
   }
@@ -342,7 +386,8 @@ export class ChangeStore {
       await this.#refreshChange(changeId);
       const c = this.#changes.get(changeId);
       if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
-      // Allow submission when change is DRAFT, PLANNED, or READY
+      // Allow submission when change is DRAFT, PLANNED, or READY.
+      // PLANNED allows re-submitting a revised plan before acceptance.
       if (!['DRAFT', 'PLANNED', 'READY'].includes(c.state)) {
         throw Object.assign(
           new Error(`Cannot submit plan: change is in ${c.state}, expected DRAFT, PLANNED or READY`),
@@ -376,8 +421,7 @@ export class ChangeStore {
       } else if (c.state === 'PLANNED') {
         // Re-submitting a plan on an already-PLANNED change doesn't change state.
       } else {
-        // DRAFT → PLANNED is a plan-lifecycle transition; persist via planState override
-        // so rehydration restores the correct state without replaying plan audit events.
+        // DRAFT → PLANNED: use store-level override so it persists via planState.
         c._setPlanState('PLANNED');
       }
       // Record in audit with planId so it's discoverable after restart
@@ -392,7 +436,7 @@ export class ChangeStore {
       });
       (this.#plans ??= []).push(plan);
       await this.#persist();
-      return plan;
+      return structuredClone(plan);
     } finally {
       release();
     }
@@ -402,7 +446,7 @@ export class ChangeStore {
    * Accept a PLANNED plan: transition change READY → ACCEPTED (via PLANNED)
    * and store the acceptedPlanId.
    */
-  async acceptPlan(changeId, planId, { authorized = true } = {}) {
+  async acceptPlan(changeId, planId, { authorized = false } = {}) {
     if (!authorized) {
       throw Object.assign(new Error('Not authorized to accept plan'), { code: 'FORBIDDEN' });
     }
@@ -411,23 +455,24 @@ export class ChangeStore {
       await this.#refreshChange(changeId);
       const c = this.#changes.get(changeId);
       if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
-      const plan = (this.#plans ?? []).find((p) => p.id === planId);
-      if (!plan) throw Object.assign(new Error(`Plan ${planId} not found`), { code: 'NOT_FOUND' });
-      if (plan.changeId !== changeId) throw Object.assign(new Error('Plan does not belong to this change'), { code: 'MISMATCH' });
-      if (plan.status !== 'PLANNED') throw Object.assign(new Error(`Cannot accept plan in ${plan.status} state`), { code: 'INVALID_PLAN_STATE' });
-      // PLANNED → READY (already PLANNED), then store acceptedPlanId
-      c.acceptedPlanId = plan.id;
-      // Transition change READY ← PLANNED is already handled by submitPlan which set it to PLANNED.
-      // We now transition PLANNED → READY directly via the domain machine (already in PLANNED)
-      // and then mark accepted. The store level just sets acceptedPlanId and updates change state.
+      // M2: only the current (latest) PLANNED revision may be accepted
+      const revisions = (this.#plans ?? []).filter((p) => p.changeId === changeId).sort((a, b) => a.revision - b.revision);
+      const currentPlan = revisions[revisions.length - 1];
+      if (!currentPlan || currentPlan.status !== 'PLANNED') {
+        throw Object.assign(new Error('No current PLANNED revision to accept'), { code: 'INVALID_PLAN_STATE' });
+      }
+      if (planId !== currentPlan.id) {
+        throw Object.assign(new Error('Cannot accept a non-current plan revision'), { code: 'MISMATCH' });
+      }
       if (c.state !== 'PLANNED') {
         throw Object.assign(new Error(`Change is in ${c.state}, expected PLANNED`), { code: 'INVALID_STATE' });
       }
+      c.acceptedPlanId = planId;
       // PLANNED → READY is a plan-lifecycle transition; use store-level override
       // so it persists via planState on disk.
       c._setPlanState('READY');
-      plan.status = 'ACCEPTED';
-      plan.acceptedAt = new Date().toISOString();
+      currentPlan.status = 'ACCEPTED';
+      currentPlan.acceptedAt = new Date().toISOString();
       await reseedFromDisk(this.#file);
       this.#audit.push({
         eventId: nextEventId(),
@@ -438,7 +483,7 @@ export class ChangeStore {
         planId,
       });
       await this.#persist();
-      return { ...plan };
+      return structuredClone(currentPlan);
     } finally {
       release();
     }
@@ -452,21 +497,15 @@ export class ChangeStore {
     try {
       const plan = (this.#plans ?? []).find((p) => p.id === planId);
       if (!plan) throw Object.assign(new Error(`Plan ${planId} not found`), { code: 'NOT_FOUND' });
-      if (plan.status === 'ACCEPTED') {
-        throw Object.assign(new Error('Cannot modify an accepted plan: plan content is immutable'), { code: 'PLAN_IMMUTABLE' });
+      if (plan.status !== 'PLANNED') {
+        throw Object.assign(new Error(`Cannot modify a ${plan.status} plan: only PLANNED revisions may be updated`), { code: 'PLAN_IMMUTABLE' });
       }
-      // Replace the non-accepted plan content
-      const existingRevisions = (this.#plans ?? []).filter((p) => p.changeId === plan.changeId && p.revision === plan.revision);
-      // Find and update in-place
-      const idx = (this.#plans ?? []).findIndex((p) => p.id === planId);
-      if (idx !== -1) {
-        const digest = await this.#digest(content);
-        plan.content = content;
-        plan.digest = digest;
-        plan.updatedAt = new Date().toISOString();
-        await this.#persist();
-      }
-      return { ...plan };
+      const digest = await this.#digest(content);
+      plan.content = content;
+      plan.digest = digest;
+      plan.updatedAt = new Date().toISOString();
+      await this.#persist();
+      return structuredClone(plan);
     } finally {
       release();
     }

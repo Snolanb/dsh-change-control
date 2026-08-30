@@ -74,12 +74,6 @@ export function createChange({ title, objective = '', acceptanceCriteria = [], r
 export class Change {
   #state = 'DRAFT';
 
-  // ponytail: plan-lifecycle transitions (READY→PLANNED) live outside the domain
-  // state machine; store them here so the domain stays clean and tests can't
-  // reach an arbitrary public setter.
-  /** @type {Map<Change, string>} */
-  #planStateOverride = new Map();
-
   /**
    * @param {object} params
    * @param {string} params.title
@@ -115,6 +109,11 @@ export class Change {
     return this.#planStateOverride.get(this) ?? this.#state;
   }
 
+  // ponytail: plan-lifecycle overrides (READY→PLANNED) stored here so the
+  // domain state machine stays clean and tests can't reach a public setter.
+  /** @type {Map<Change, string>} */
+  #planStateOverride = new Map();
+
   /**
    * Internal: store-only state override for plan lifecycle transitions.
    * @param {string} nextState
@@ -133,21 +132,39 @@ export class Change {
   }
 
   /**
+   * Internal: set the canonical domain state directly (for rehydration).
+   * @param {string} s
+   */
+  _setDomainState(s) {
+    this.#state = s;
+  }
+
+  /**
+   * Internal: read the canonical domain state (for serialization).
+   * @returns {string}
+   */
+  _getDomainState() {
+    return this.#state;
+  }
+
+  /**
    * Perform a semantic state transition.
    * @param {string} nextState
    * @returns {Change} this
    */
   transitionTo(nextState) {
-    const allowed = TRANSITIONS[this.#state];
+    const allowed = TRANSITIONS[this.state];
     if (!allowed || !allowed.includes(nextState)) {
       throw new ChangeDomainError(
-        `Cannot transition from ${this.#state} to ${nextState}`,
-        this.#state,
+        `Cannot transition from ${this.state} to ${nextState}`,
+        this.state,
         nextState
       );
     }
     // Only mutate state after successful validation
     this.#state = nextState;
+    // Clear any plan-lifecycle override once a domain transition occurs.
+    this.#planStateOverride.delete(this);
     this.updatedAt = new Date().toISOString();
     return this;
   }
