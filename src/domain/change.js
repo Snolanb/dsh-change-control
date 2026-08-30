@@ -102,9 +102,48 @@ export class Change {
 
   /**
    * Current state (read-only getter).
+   * Returns any plan-lifecycle override first, then falls back to the domain state.
    * @returns {string}
    */
   get state() {
+    return this.#planStateOverride.get(this) ?? this.#state;
+  }
+
+  // ponytail: plan-lifecycle overrides (READY→PLANNED) stored here so the
+  // domain state machine stays clean and tests can't reach a public setter.
+  /** @type {Map<Change, string>} */
+  #planStateOverride = new Map();
+
+  /**
+   * Internal: store-only state override for plan lifecycle transitions.
+   * @param {string} nextState
+   */
+  _setPlanState(nextState) {
+    this.#planStateOverride.set(this, nextState);
+    this.updatedAt = new Date().toISOString();
+  }
+
+  /**
+   * Internal: read the plan state override (returns undefined if none).
+   * @returns {string | undefined}
+   */
+  _getPlanState() {
+    return this.#planStateOverride.get(this);
+  }
+
+  /**
+   * Internal: set the canonical domain state directly (for rehydration).
+   * @param {string} s
+   */
+  _setDomainState(s) {
+    this.#state = s;
+  }
+
+  /**
+   * Internal: read the canonical domain state (for serialization).
+   * @returns {string}
+   */
+  _getDomainState() {
     return this.#state;
   }
 
@@ -114,17 +153,21 @@ export class Change {
    * @returns {Change} this
    */
   transitionTo(nextState) {
-    const allowed = TRANSITIONS[this.#state];
+    const allowed = TRANSITIONS[this.state];
     if (!allowed || !allowed.includes(nextState)) {
       throw new ChangeDomainError(
-        `Cannot transition from ${this.#state} to ${nextState}`,
-        this.#state,
+        `Cannot transition from ${this.state} to ${nextState}`,
+        this.state,
         nextState
       );
     }
     // Only mutate state after successful validation
     this.#state = nextState;
+    // Clear any plan-lifecycle override once a domain transition occurs.
+    this.#planStateOverride.delete(this);
     this.updatedAt = new Date().toISOString();
     return this;
   }
+
+
 }
