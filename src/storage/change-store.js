@@ -145,6 +145,12 @@ export class ChangeStore {
   #audit;
   /** @type {import('../domain/change.js').Plan[] | null} */
   #plans = null;
+  /** @type {Map<string, Array<{changeId: string, sessionId: string, role: string}>}> */
+  #bindings = new Map();
+  /** @type {Map<string, Array<{changeId: string, attemptId: string, workerId: string, status: string, recordedAt: string}>>} */
+  #attempts = new Map();
+  /** @type {Set<string>} Keys of locally mutated bindings (changeId:sessionId) */
+  #dirtyBindings = new Set();
 
   constructor(file) {
     this.#file = canonicalPath(file);
@@ -182,6 +188,20 @@ export class ChangeStore {
     if (data.plans && Array.isArray(data.plans)) {
       this.#plans = data.plans;
     }
+    // Bindings: keyed by changeId.
+    if (data.bindings && Array.isArray(data.bindings)) {
+      for (const b of data.bindings) {
+        if (!this.#bindings.has(b.changeId)) this.#bindings.set(b.changeId, []);
+        this.#bindings.get(b.changeId).push(b);
+      }
+    }
+    // Attempts: keyed by changeId.
+    if (data.attempts && Array.isArray(data.attempts)) {
+      for (const a of data.attempts) {
+        if (!this.#attempts.has(a.changeId)) this.#attempts.set(a.changeId, []);
+        this.#attempts.get(a.changeId).push(a);
+      }
+    }
   }
 
   /**
@@ -211,6 +231,22 @@ export class ChangeStore {
     // Reload plans from disk so plan statuses (ACCEPTED/SUPERSEDED) are current.
     if (data.plans && Array.isArray(data.plans)) {
       this.#plans = data.plans;
+    }
+    // Reload bindings from disk to preserve records from other instances.
+    if (data.bindings && Array.isArray(data.bindings)) {
+      this.#bindings = new Map();
+      for (const b of data.bindings) {
+        if (!this.#bindings.has(b.changeId)) this.#bindings.set(b.changeId, []);
+        this.#bindings.get(b.changeId).push(b);
+      }
+    }
+    // Reload attempts from disk to preserve records from other instances.
+    if (data.attempts && Array.isArray(data.attempts)) {
+      this.#attempts = new Map();
+      for (const a of data.attempts) {
+        if (!this.#attempts.has(a.changeId)) this.#attempts.set(a.changeId, []);
+        this.#attempts.get(a.changeId).push(a);
+      }
     }
     // NOTE: we do NOT replace this.#audit here — local audit entries are
     // merged in #persist() via eventId dedup, preserving uncommitted events.
@@ -287,12 +323,39 @@ export class ChangeStore {
       }
     }
 
+    // Merge bindings: union by (changeId, sessionId).
+    // Only dirty local bindings override disk; all other bindings come from disk.
+    const diskBindings = Array.isArray(diskData?.bindings) ? diskData.bindings : [];
+    const mergedBindings = new Map();
+    for (const b of diskBindings) mergedBindings.set(`${b.changeId}:${b.sessionId}`, b);
+    for (const b of [...this.#bindings.values()].flat()) {
+      const key = `${b.changeId}:${b.sessionId}`;
+      // Only dirty (locally mutated) bindings override disk.
+      if (this.#dirtyBindings.has(key)) {
+        mergedBindings.set(key, b);
+      }
+    }
+
+    // Merge attempts: union by attemptId, prefer local.
+    const diskAttempts = Array.isArray(diskData?.attempts) ? diskData.attempts : [];
+    const mergedAttempts = new Map();
+    for (const a of diskAttempts) mergedAttempts.set(a.attemptId, a);
+    for (const a of [...this.#attempts.values()].flat()) {
+      if (!mergedAttempts.has(a.attemptId)) {
+        mergedAttempts.set(a.attemptId, a);
+      }
+    }
+
     await writeJson(this.#file, {
       changes: [...mergedChanges.values()],
       audit: mergedAudit,
       // Plans are kept as a top-level array for direct retrieval.
       plans: [...mergedPlans.values()],
+      bindings: [...mergedBindings.values()],
+      attempts: [...mergedAttempts.values()],
     });
+    // Clear dirty flags after successful persist.
+    this.#dirtyBindings.clear();
   }
 
   async create(input) {
@@ -570,6 +633,159 @@ export class ChangeStore {
       return structuredClone(plan);
     } finally {
       release();
+    }
+  }
+
+  // ─── Session role bindings ──────────────────────────────────────────────────
+
+  /**
+   * Bind a session to a role on a Change.
+   * Signature: bindRole(changeId, sessionId, role, { rebind } = {})
+   * Rejected if the Change does not exist or if an existing binding for that
+   * (changeId, sessionId) pair holds a different role without explicit rebind.
+   */
+  async bindRole(changeId, sessionId, role, opts = {}) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) {
+        // Ensure file exists with empty bindings to demonstrate no partial persistence
+        await this.#persist();
+        throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      }
+
+      const changeBindings = this.#bindings.get(changeId) ?? [];
+      const existing = changeBindings.find((b) => b.sessionId === sessionId);
+      if (existing) {
+        if (opts.rebind) {
+          // Replace the existing binding with the new role
+          const idx = changeBindings.indexOf(existing);
+          changeBindings[idx] = { changeId, sessionId, role };
+          this.#bindings.set(changeId, changeBindings);
+          this.#dirtyBindings.add(`${changeId}:${sessionId}`);
+          await this.#persist();
+          return structuredClone(changeBindings[idx]);
+        }
+        throw Object.assign(new Error(`Session ${sessionId} is already bound to role ${existing.role} on change ${changeId}`), { code: 'ALREADY_BOUND' });
+      }
+
+      const binding = { changeId, sessionId, role };
+      changeBindings.push(binding);
+      this.#bindings.set(changeId, changeBindings);
+      this.#dirtyBindings.add(`${changeId}:${sessionId}`);
+      await this.#persist();
+      return structuredClone(binding);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Resolve a session's binding for a role on a Change.
+   * Returns the role string or throws if no binding exists.
+   */
+  async resolveRole(changeId, sessionId) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshBindingsAndAttempts();
+      const binding = (this.#bindings.get(changeId) ?? []).find(
+        (b) => b.changeId === changeId && b.sessionId === sessionId
+      );
+      if (!binding) throw Object.assign(new Error(`No binding for session ${sessionId} on change ${changeId}`), { code: 'NOT_FOUND' });
+      return binding.role;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * List all role bindings for a Change.
+   */
+  async listRoleBindings() {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshBindingsAndAttempts();
+      return structuredClone([...this.#bindings.values()].flat());
+    } finally {
+      release();
+    }
+  }
+
+  // ─── Worker implementation attempts ─────────────────────────────────────────
+
+  /**
+   * Record an implementation attempt for a Change, independent of session identity.
+   */
+  async recordAttempt(changeId, { attemptId, workerId, status }) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+
+      const attempt = { changeId, attemptId, workerId, status, recordedAt: new Date().toISOString() };
+      const changeAttempts = this.#attempts.get(changeId) ?? [];
+      changeAttempts.push(attempt);
+      this.#attempts.set(changeId, changeAttempts);
+      await this.#persist();
+      return structuredClone(attempt);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * List all recorded attempts for a Change.
+   */
+  async listAttempts(changeId) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshBindingsAndAttempts();
+      return structuredClone(this.#attempts.get(changeId) ?? []);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Reload bindings and attempts from disk under lock.
+   * Preserves local uncommitted changes while picking up concurrent writes.
+   * Bindings are synchronized by (changeId, sessionId) - replacing role on rebind.
+   */
+  async #refreshBindingsAndAttempts() {
+    let data;
+    try {
+      data = await readJson(this.#file);
+    } catch {
+      return;
+    }
+    if (!data) return;
+    // Reload bindings from disk, sync by (changeId, sessionId)
+    if (data.bindings && Array.isArray(data.bindings)) {
+      for (const b of data.bindings) {
+        if (!this.#bindings.has(b.changeId)) this.#bindings.set(b.changeId, []);
+        const changeBindings = this.#bindings.get(b.changeId);
+        const existingIdx = changeBindings.findIndex((eb) => eb.sessionId === b.sessionId);
+        if (existingIdx >= 0) {
+          // Replace existing binding (handles rebind case)
+          changeBindings[existingIdx] = { changeId: b.changeId, sessionId: b.sessionId, role: b.role };
+        } else {
+          // Add new binding
+          changeBindings.push({ changeId: b.changeId, sessionId: b.sessionId, role: b.role });
+        }
+      }
+    }
+    // Reload attempts from disk
+    if (data.attempts && Array.isArray(data.attempts)) {
+      for (const a of data.attempts) {
+        if (!this.#attempts.has(a.changeId)) this.#attempts.set(a.changeId, []);
+        // Only add if not already present (preserve local adds)
+        const existing = this.#attempts.get(a.changeId).find((ea) => ea.attemptId === a.attemptId && ea.workerId === a.workerId);
+        if (!existing) {
+          this.#attempts.get(a.changeId).push(a);
+        }
+      }
     }
   }
 }
