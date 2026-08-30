@@ -74,6 +74,12 @@ export function createChange({ title, objective = '', acceptanceCriteria = [], r
 export class Change {
   #state = 'DRAFT';
 
+  // ponytail: plan-lifecycle transitions (READY→PLANNED) live outside the domain
+  // state machine; store them here so the domain stays clean and tests can't
+  // reach an arbitrary public setter.
+  /** @type {Map<Change, string>} */
+  #planStateOverride = new Map();
+
   /**
    * @param {object} params
    * @param {string} params.title
@@ -102,10 +108,28 @@ export class Change {
 
   /**
    * Current state (read-only getter).
+   * Returns any plan-lifecycle override first, then falls back to the domain state.
    * @returns {string}
    */
   get state() {
-    return this.#state;
+    return this.#planStateOverride.get(this) ?? this.#state;
+  }
+
+  /**
+   * Internal: store-only state override for plan lifecycle transitions.
+   * @param {string} nextState
+   */
+  _setPlanState(nextState) {
+    this.#planStateOverride.set(this, nextState);
+    this.updatedAt = new Date().toISOString();
+  }
+
+  /**
+   * Internal: read the plan state override (returns undefined if none).
+   * @returns {string | undefined}
+   */
+  _getPlanState() {
+    return this.#planStateOverride.get(this);
   }
 
   /**
@@ -127,4 +151,6 @@ export class Change {
     this.updatedAt = new Date().toISOString();
     return this;
   }
+
+
 }
