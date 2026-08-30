@@ -252,14 +252,13 @@ export class ChangeStore {
           updatedAt: c.updatedAt,
         });
       } else if (diskRec) {
-        // Preserve disk state fields; only overlay mutable scalar fields
+        // Preserve all lifecycle fields from disk; only overlay mutable scalars.
         mergedChanges.set(id, {
           ...diskRec,
           title: c.title,
           objective: c.objective,
           acceptanceCriteria: c.acceptanceCriteria,
           risk: c.risk,
-          acceptedPlanId: c.acceptedPlanId,
           updatedAt: c.updatedAt,
         });
       }
@@ -271,12 +270,22 @@ export class ChangeStore {
       ...this.#audit.filter((e) => !diskEventIds.has(e.eventId)),
     ];
 
-    // Merge plans: start from disk, overlay our local plans (by id).
-    // This prevents a stale writer with no plan snapshot from wiping on-disk plans.
+    // Merge plans: start from disk, overlay local plans only when the store
+    // has local uncommitted audit events for the associated change.
+    // This prevents a stale writer from restoring superseded/accepted plan
+    // statuses that were updated by another instance (B3 extended).
     const diskPlans = Array.isArray(diskData?.plans) ? diskData.plans : [];
     const mergedPlans = new Map();
     for (const p of diskPlans) mergedPlans.set(p.id, p);
-    for (const p of this.#plans ?? []) mergedPlans.set(p.id, p);
+    if (this.#plans) {
+      for (const p of this.#plans) {
+        // Only overlay plans from stores that have uncommitted events
+        const relatedChangeEvents = this.#audit.some((e) => e.changeId === p.changeId && !diskEventIds.has(e.eventId));
+        if (relatedChangeEvents || !mergedPlans.has(p.id)) {
+          mergedPlans.set(p.id, p);
+        }
+      }
+    }
 
     await writeJson(this.#file, {
       changes: [...mergedChanges.values()],

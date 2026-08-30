@@ -261,3 +261,37 @@ test('acceptPlan rejects non-current revision', async (t) => {
   const accepted = await store.acceptPlan(change.id, second.id, { authorized: true });
   assert.equal(accepted.status, 'ACCEPTED');
 });
+
+test('stale writer does not restore superseded acceptedPlanId', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-plan-b3a-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'changes.json');
+
+  // Store A accepts p1
+  const storeA = await ChangeStore.open(file);
+  const change = await storeA.create({ title: 'B3A stale' });
+  const p1 = await storeA.submitPlan(change.id, firstPlan);
+  await storeA.acceptPlan(change.id, p1.id, { authorized: true });
+  assert.equal((await storeA.get(change.id)).acceptedPlanId, p1.id);
+
+  // Store B opens, submits p2 (supersedes p1, resets acceptedPlanId)
+  const storeB = await ChangeStore.open(file);
+  const p2 = await storeB.submitPlan(change.id, { ...firstPlan, objective: 'B3A v2' });
+  assert.equal(p2.status, 'PLANNED');
+  const cB = await storeB.get(change.id);
+  assert.equal(cB.acceptedPlanId, null);
+
+  // Stale A performs an unrelated mutation and persists
+  const changeA2 = await storeA.create({ title: 'Stale A unrelated' });
+  await storeA.transition(changeA2.id, 'PLANNED');
+
+  // Fresh reopen: acceptedPlanId must remain null, p1 must be SUPERSEDED
+  const storeC = await ChangeStore.open(file);
+  const cC = await storeC.get(change.id);
+  assert.equal(cC.state, 'PLANNED');
+  assert.equal(cC.acceptedPlanId, null);
+  const revisions = await storeC.listPlans(change.id);
+  assert.equal(revisions.length, 2);
+  assert.equal(revisions.find((p) => p.id === p1.id)?.status, 'SUPERSEDED');
+  assert.equal(revisions.find((p) => p.id === p2.id)?.status, 'PLANNED');
+});
