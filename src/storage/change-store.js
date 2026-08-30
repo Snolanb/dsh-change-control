@@ -149,6 +149,8 @@ export class ChangeStore {
   #bindings = new Map();
   /** @type {Map<string, Array<{changeId: string, attemptId: string, workerId: string, status: string, recordedAt: string}>>} */
   #attempts = new Map();
+  /** @type {Set<string>} Keys of locally mutated bindings (changeId:sessionId) */
+  #dirtyBindings = new Set();
 
   constructor(file) {
     this.#file = canonicalPath(file);
@@ -321,14 +323,17 @@ export class ChangeStore {
       }
     }
 
-    // Merge bindings: union by (changeId, sessionId), local is authoritative under lock.
+    // Merge bindings: union by (changeId, sessionId).
+    // Only dirty local bindings override disk; all other bindings come from disk.
     const diskBindings = Array.isArray(diskData?.bindings) ? diskData.bindings : [];
     const mergedBindings = new Map();
     for (const b of diskBindings) mergedBindings.set(`${b.changeId}:${b.sessionId}`, b);
     for (const b of [...this.#bindings.values()].flat()) {
       const key = `${b.changeId}:${b.sessionId}`;
-      // Local binding is authoritative: always overwrite with local value.
-      mergedBindings.set(key, b);
+      // Only dirty (locally mutated) bindings override disk.
+      if (this.#dirtyBindings.has(key)) {
+        mergedBindings.set(key, b);
+      }
     }
 
     // Merge attempts: union by attemptId, prefer local.
@@ -349,6 +354,8 @@ export class ChangeStore {
       bindings: [...mergedBindings.values()],
       attempts: [...mergedAttempts.values()],
     });
+    // Clear dirty flags after successful persist.
+    this.#dirtyBindings.clear();
   }
 
   async create(input) {
@@ -656,6 +663,7 @@ export class ChangeStore {
           const idx = changeBindings.indexOf(existing);
           changeBindings[idx] = { changeId, sessionId, role };
           this.#bindings.set(changeId, changeBindings);
+          this.#dirtyBindings.add(`${changeId}:${sessionId}`);
           await this.#persist();
           return structuredClone(changeBindings[idx]);
         }
@@ -665,6 +673,7 @@ export class ChangeStore {
       const binding = { changeId, sessionId, role };
       changeBindings.push(binding);
       this.#bindings.set(changeId, changeBindings);
+      this.#dirtyBindings.add(`${changeId}:${sessionId}`);
       await this.#persist();
       return structuredClone(binding);
     } finally {

@@ -248,3 +248,32 @@ test('rebind role persists and resolves after store reopen', () => withStore(asy
   assert.equal(bindings.length, 1);
   assert.equal(bindings[0].role, 'reviewer');
 }));
+
+// Regression for F4: B reads binding, A rebinds, B does unrelated create, fresh store sees A's new role.
+test('unrelated create by stale reader preserves external rebind in fresh store', () => withStore(async (file) => {
+  const [storeA, storeB] = await Promise.all([
+    ChangeStore.open(file),
+    ChangeStore.open(file),
+  ]);
+
+  const change = await storeA.create(input);
+
+  // Store A binds session-a to implementer
+  await storeA.bindRole(change.id, 'session-a', 'implementer');
+
+  // Store B reads the binding
+  assert.equal(await storeB.resolveRole(change.id, 'session-a'), 'implementer');
+
+  // Store A rebinds session-a to reviewer
+  await storeA.bindRole(change.id, 'session-a', 'reviewer', { rebind: true });
+
+  // Store B performs an unrelated create (should not erase A's rebind)
+  const otherChange = await storeB.create({ title: 'Other', objective: '', acceptanceCriteria: [], risk: 'normal' });
+  await storeB.bindRole(otherChange.id, 'session-b', 'reviewer');
+
+  // Fresh store should see A's new role, not B's stale cached value
+  const storeC = await ChangeStore.open(file);
+  assert.equal(await storeC.resolveRole(change.id, 'session-a'), 'reviewer');
+  const bindings = await storeC.listRoleBindings();
+  assert.ok(bindings.some((b) => b.changeId === change.id && b.sessionId === 'session-a' && b.role === 'reviewer'));
+}));
