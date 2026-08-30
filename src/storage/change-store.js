@@ -321,13 +321,37 @@ export class ChangeStore {
       }
     }
 
+    // Merge bindings: union by (changeId, sessionId), prefer local when this instance mutated it.
+    const diskBindings = Array.isArray(diskData?.bindings) ? diskData.bindings : [];
+    const mergedBindings = new Map();
+    for (const b of diskBindings) mergedBindings.set(`${b.changeId}:${b.sessionId}`, b);
+    for (const b of [...this.#bindings.values()].flat()) {
+      const key = `${b.changeId}:${b.sessionId}`;
+      const diskRec = mergedBindings.get(key);
+      // Prefer local binding if this store has local uncommitted events for this change
+      const hasLocalEvents = this.#audit.some((e) => e.changeId === b.changeId && !diskEventIds.has(e.eventId));
+      if (hasLocalEvents || !diskRec) {
+        mergedBindings.set(key, b);
+      }
+    }
+
+    // Merge attempts: union by attemptId, prefer local.
+    const diskAttempts = Array.isArray(diskData?.attempts) ? diskData.attempts : [];
+    const mergedAttempts = new Map();
+    for (const a of diskAttempts) mergedAttempts.set(a.attemptId, a);
+    for (const a of [...this.#attempts.values()].flat()) {
+      if (!mergedAttempts.has(a.attemptId)) {
+        mergedAttempts.set(a.attemptId, a);
+      }
+    }
+
     await writeJson(this.#file, {
       changes: [...mergedChanges.values()],
       audit: mergedAudit,
       // Plans are kept as a top-level array for direct retrieval.
       plans: [...mergedPlans.values()],
-      bindings: [...this.#bindings.values()].flat(),
-      attempts: [...this.#attempts.values()].flat(),
+      bindings: [...mergedBindings.values()],
+      attempts: [...mergedAttempts.values()],
     });
   }
 
@@ -655,12 +679,10 @@ export class ChangeStore {
   /**
    * Resolve a session's binding for a role on a Change.
    * Returns the role string or throws if no binding exists.
-   * Refreshes from disk to preserve records from other instances.
    */
   async resolveRole(changeId, sessionId) {
     const release = await acquireLock(this.#file);
     try {
-      await this.#refreshBindingsAndAttempts();
       const binding = (this.#bindings.get(changeId) ?? []).find(
         (b) => b.changeId === changeId && b.sessionId === sessionId
       );
@@ -673,12 +695,10 @@ export class ChangeStore {
 
   /**
    * List all role bindings for a Change.
-   * Refreshes from disk to preserve records from other instances.
    */
   async listRoleBindings() {
     const release = await acquireLock(this.#file);
     try {
-      await this.#refreshBindingsAndAttempts();
       return structuredClone([...this.#bindings.values()].flat());
     } finally {
       release();
@@ -710,12 +730,10 @@ export class ChangeStore {
 
   /**
    * List all recorded attempts for a Change.
-   * Refreshes from disk to preserve records from other instances.
    */
   async listAttempts(changeId) {
     const release = await acquireLock(this.#file);
     try {
-      await this.#refreshBindingsAndAttempts();
       return structuredClone(this.#attempts.get(changeId) ?? []);
     } finally {
       release();
