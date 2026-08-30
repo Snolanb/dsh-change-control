@@ -377,8 +377,22 @@ export class ChangeStore {
   /**
    * Compute a stable content digest (SHA-256 hex) with deterministic key ordering.
    */
+  /**
+   * Recursively canonicalize an object: sort all object keys alphabetically,
+   * preserve array order. Produces a deterministic JSON string for hashing.
+   */
+  static #canonicalize(obj) {
+    if (Array.isArray(obj)) return obj.map((item) => ChangeStore.#canonicalize(item));
+    if (obj !== null && typeof obj === 'object' && !(obj instanceof Date)) {
+      const sorted = {};
+      for (const key of Object.keys(obj).sort()) sorted[key] = ChangeStore.#canonicalize(obj[key]);
+      return sorted;
+    }
+    return obj;
+  }
+
   async #digest(content) {
-    const bytes = new TextEncoder().encode(JSON.stringify(content, Object.keys(content).sort()));
+    const bytes = new TextEncoder().encode(JSON.stringify(ChangeStore.#canonicalize(content)));
     const hash = await crypto.subtle.digest('SHA-256', bytes);
     return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, '0')).join('');
   }
@@ -513,6 +527,16 @@ export class ChangeStore {
       plan.content = content;
       plan.digest = digest;
       plan.updatedAt = new Date().toISOString();
+      // Append a plan-lifecycle audit event so #persist treats this store's
+      // plan write as committed (stale writers preserve disk plans).
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId: plan.changeId,
+        from: 'PLANNED',
+        to: 'PLANNED',
+        planId: plan.id,
+        ts: plan.updatedAt,
+      });
       await this.#persist();
       return structuredClone(plan);
     } finally {

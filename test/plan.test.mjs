@@ -295,3 +295,58 @@ test('stale writer does not restore superseded acceptedPlanId', async (t) => {
   assert.equal(revisions.find((p) => p.id === p1.id)?.status, 'SUPERSEDED');
   assert.equal(revisions.find((p) => p.id === p2.id)?.status, 'PLANNED');
 });
+
+test('digest is content-stable for nested objects with differing key order', async (t) => {
+  const { store, change } = await withChange(t);
+  const shallowA = await store.submitPlan(change.id, { objective: 'X', steps: ['a'] });
+  const shallowB = await store.submitPlan(change.id, { steps: ['a'], objective: 'X' });
+  assert.equal(shallowA.digest, shallowB.digest);
+
+  const nestedA = await store.submitPlan(change.id, {
+    meta: { z: 1, a: 2 },
+    steps: [{ id: 1, label: 'first' }, { id: 2, label: 'second' }],
+  });
+  const nestedB = await store.submitPlan(change.id, {
+    steps: [{ label: 'first', id: 1 }, { id: 2, label: 'second' }],
+    meta: { a: 2, z: 1 },
+  });
+  assert.equal(nestedA.digest, nestedB.digest);
+
+  // Different nested content must yield different digests
+  const nestedC = await store.submitPlan(change.id, {
+    meta: { z: 999, a: 2 },
+    steps: [{ id: 1, label: 'first' }],
+  });
+  assert.notEqual(nestedA.digest, nestedC.digest);
+});
+
+test('updatePlan persists through reopen and stale writers', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-plan-update-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'changes.json');
+
+  const store = await ChangeStore.open(file);
+  const change = await store.create({ title: 'Update plan' });
+  const plan = await store.submitPlan(change.id, { objective: 'v1', steps: ['a'] });
+  assert.equal(plan.status, 'PLANNED');
+
+  // Update the plan
+  const updated = await store.updatePlan(plan.id, { objective: 'v2', steps: ['a', 'b'] });
+  assert.equal(updated.content.objective, 'v2');
+
+  // Persist survives reopen
+  const store2 = await ChangeStore.open(file);
+  const plan2 = await store2.getPlan(plan.id);
+  assert.equal(plan2.content.objective, 'v2');
+  assert.equal(plan2.status, 'PLANNED');
+
+  // Stale writer after update does not erase the update
+  const store3 = await ChangeStore.open(file);
+  const change2 = await store3.create({ title: 'Stale update' });
+  await store3.transition(change2.id, 'PLANNED');
+
+  const store4 = await ChangeStore.open(file);
+  const plan3 = await store4.getPlan(plan.id);
+  assert.equal(plan3.content.objective, 'v2');
+  assert.equal(plan3.status, 'PLANNED');
+});
