@@ -636,6 +636,99 @@ export class ChangeStore {
     }
   }
 
+  // ─── Semantic change operations (proof, review, repair) ─────────────────────
+
+  /**
+   * Submit proof of implementation for a change in PROOF state.
+   * Records the proof content and transitions the change state.
+   */
+  async submitProof(changeId, content) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      // Accept proof in IMPLEMENTING or PROOF state (worker can submit during implementation)
+      if (c.state !== 'PROOF' && c.state !== 'IMPLEMENTING') {
+        throw Object.assign(new Error(`Cannot submit proof: change is in ${c.state}, expected PROOF or IMPLEMENTING`), { code: 'INVALID_STATE' });
+      }
+      // Record proof in audit
+      await reseedFromDisk(this.#file);
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId,
+        from: 'PROOF',
+        to: 'PROOF',
+        ts: c.updatedAt,
+        proof: content,
+      });
+      await this.#persist();
+      return { ok: true, changeId, recordedAt: new Date().toISOString() };
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Submit a review for a change in REVIEW state.
+   * Records the review content and transitions the change state.
+   */
+  async submitReview(changeId, content) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      if (c.state !== 'REVIEW') {
+        throw Object.assign(new Error(`Cannot submit review: change is in ${c.state}, expected REVIEW`), { code: 'INVALID_STATE' });
+      }
+      // Record review in audit
+      await reseedFromDisk(this.#file);
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId,
+        from: 'REVIEW',
+        to: 'REVIEW',
+        ts: c.updatedAt,
+        review: content,
+      });
+      await this.#persist();
+      return { ok: true, changeId, recordedAt: new Date().toISOString() };
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Submit repair for a change in REPAIR state.
+   * Records the repair content and transitions the change state.
+   */
+  async submitRepair(changeId, content) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      if (c.state !== 'REPAIR') {
+        throw Object.assign(new Error(`Cannot submit repair: change is in ${c.state}, expected REPAIR`), { code: 'INVALID_STATE' });
+      }
+      // Record repair in audit
+      await reseedFromDisk(this.#file);
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId,
+        from: 'REPAIR',
+        to: 'REPAIR',
+        ts: c.updatedAt,
+        repair: content,
+      });
+      await this.#persist();
+      return { ok: true, changeId, recordedAt: new Date().toISOString() };
+    } finally {
+      release();
+    }
+  }
+
   // ─── Session role bindings ──────────────────────────────────────────────────
 
   /**

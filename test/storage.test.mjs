@@ -227,14 +227,15 @@ test('REVIEW-REPAIR-PREFLIGHT-REVIEW cycles preserve history count and state acr
   await store.transition(created.id, 'PLANNED');
   await store.transition(created.id, 'READY');
   await store.transition(created.id, 'IMPLEMENTING');
+  await store.transition(created.id, 'PROOF');
   await store.transition(created.id, 'PREFLIGHT');
   await store.transition(created.id, 'REVIEW');
 
   const beforeReopen = snapshot(await store.get(created.id));
   assert.equal(beforeReopen.state, 'REVIEW');
   const historyBefore = await store.history(created.id);
-  // DRAFT + PLANNED + READY + IMPLEMENTING + PREFLIGHT + REVIEW = 6 events
-  assert.equal(historyBefore.length, 6);
+  // DRAFT + PLANNED + READY + IMPLEMENTING + PROOF + PREFLIGHT + REVIEW = 7 events
+  assert.equal(historyBefore.length, 7);
 
   // Two full REVIEW->REPAIR->PREFLIGHT->REVIEW cycles = 6 more transitions
   await store.transition(created.id, 'REPAIR');
@@ -245,8 +246,8 @@ test('REVIEW-REPAIR-PREFLIGHT-REVIEW cycles preserve history count and state acr
   await store.transition(created.id, 'REVIEW');
 
   const historyAfter = await store.history(created.id);
-  // 6 initial + 6 cycle transitions = 12 events
-  assert.equal(historyAfter.length, 12);
+  // 7 initial + 6 cycle transitions = 13 events
+  assert.equal(historyAfter.length, 13);
 
   // Capture expected state after all transitions (before reopen)
   const expectedAfter = snapshot(await store.get(created.id));
@@ -257,7 +258,7 @@ test('REVIEW-REPAIR-PREFLIGHT-REVIEW cycles preserve history count and state acr
   const afterReopen = snapshot(await store2.get(created.id));
   assert.deepEqual(afterReopen, expectedAfter);
   const historyReopened = await store2.history(created.id);
-  assert.equal(historyReopened.length, 12);
+  assert.equal(historyReopened.length, 13);
 }));
 
 // AC (repair-round-3): Simulate cross-process restart by resetting the module counter,
@@ -288,6 +289,7 @@ test('cross-process restart preserves all audit events and state', async () => {
       import { ChangeStore } from '${storePath}';
       const store = await ChangeStore.open(process.env.DATA_FILE);
       const c = await store.get('${created.id}');
+      const proofTransitioned = await store.transition(c.id, 'PROOF');
       const transitioned = await store.transition(c.id, 'PREFLIGHT');
       const h = await store.history('${created.id}');
       console.log(JSON.stringify({ state: transitioned.state, historyLength: h.length }));
@@ -309,7 +311,7 @@ test('cross-process restart preserves all audit events and state', async () => {
 
     assert.equal(proc.exitCode, 0, `second process failed: ${stdout}`);
     const result = JSON.parse(stdout);
-    assert.equal(result.historyLength, 5); // 4 previous + 1 new
+    assert.equal(result.historyLength, 6); // 5 previous + 1 new (PROOF added)
     assert.equal(result.state, 'PREFLIGHT');
 
     // Reopen in this process and verify everything is preserved
@@ -317,13 +319,14 @@ test('cross-process restart preserves all audit events and state', async () => {
     const afterReopen = snapshot(await store2.get(created.id));
     assert.equal(afterReopen.state, 'PREFLIGHT');
     const historyAfter = await store2.history(created.id);
-    assert.equal(historyAfter.length, 5);
+    assert.equal(historyAfter.length, 6);
     assert.deepEqual(historyAfter.map((e) => ({ changeId: e.changeId, from: e.from, to: e.to })), [
       { changeId: created.id, from: null, to: 'DRAFT' },
       { changeId: created.id, from: 'DRAFT', to: 'PLANNED' },
       { changeId: created.id, from: 'PLANNED', to: 'READY' },
       { changeId: created.id, from: 'READY', to: 'IMPLEMENTING' },
-      { changeId: created.id, from: 'IMPLEMENTING', to: 'PREFLIGHT' },
+      { changeId: created.id, from: 'IMPLEMENTING', to: 'PROOF' },
+      { changeId: created.id, from: 'PROOF', to: 'PREFLIGHT' },
     ]);
   } finally {
     await rm(dir, { recursive: true, force: true });
