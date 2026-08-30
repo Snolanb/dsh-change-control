@@ -14,6 +14,17 @@ function service(options = {}) {
   });
 }
 
+function capture(fn) {
+  let error;
+  try {
+    fn();
+  } catch (caught) {
+    error = caught;
+  }
+  assert.ok(error, 'expected operation to throw');
+  return error;
+}
+
 function reason(error) {
   assert.ok(error instanceof AuthorizationError);
   assert.equal(typeof error.reason, 'string');
@@ -27,10 +38,10 @@ test('planner submits a plan in PLANNING', () => {
 });
 
 test('planner cannot submit proof or reviews', () => {
-  assert.equal(reason(assert.throws(() =>
+  assert.equal(reason(capture(() =>
     service({ role: 'planner', state: 'PROOF' }).submitProof(change),
   )), 'ROLE_NOT_ALLOWED');
-  assert.equal(reason(assert.throws(() =>
+  assert.equal(reason(capture(() =>
     service({ role: 'planner', state: 'REVIEW' }).submitReview(change),
   )), 'ROLE_NOT_ALLOWED');
 });
@@ -42,10 +53,10 @@ test('worker submits proof and repair in their compatible states', () => {
 });
 
 test('worker cannot accept plans or submit reviews', () => {
-  assert.equal(reason(assert.throws(() =>
+  assert.equal(reason(capture(() =>
     service({ role: 'worker', state: 'PLANNING' }).acceptPlan(change),
   )), 'ROLE_NOT_ALLOWED');
-  assert.equal(reason(assert.throws(() =>
+  assert.equal(reason(capture(() =>
     service({ role: 'worker', state: 'REVIEW' }).submitReview(change),
   )), 'ROLE_NOT_ALLOWED');
 });
@@ -56,36 +67,36 @@ test('reviewer submits a review in REVIEW', () => {
 });
 
 test('reviewer cannot perform worker mutations', () => {
-  assert.equal(reason(assert.throws(() =>
+  assert.equal(reason(capture(() =>
     service({ role: 'reviewer', state: 'PROOF' }).submitProof(change),
   )), 'ROLE_NOT_ALLOWED');
-  assert.equal(reason(assert.throws(() =>
+  assert.equal(reason(capture(() =>
     service({ role: 'reviewer', state: 'REPAIR' }).submitRepair(change),
   )), 'ROLE_NOT_ALLOWED');
 });
 
 // AC: Correct role in incompatible state is rejected.
 test('rejects a correct role when the semantic state is incompatible', () => {
-  assert.equal(reason(assert.throws(() =>
+  assert.equal(reason(capture(() =>
     service({ role: 'planner', state: 'REVIEW' }).submitPlan(change),
   )), 'INVALID_CHANGE_STATE');
-  assert.equal(reason(assert.throws(() =>
+  assert.equal(reason(capture(() =>
     service({ role: 'worker', state: 'PLANNING' }).submitProof(change),
   )), 'INVALID_CHANGE_STATE');
-  assert.equal(reason(assert.throws(() =>
+  assert.equal(reason(capture(() =>
     service({ role: 'reviewer', state: 'PROOF' }).submitReview(change),
   )), 'INVALID_CHANGE_STATE');
 });
 
 // AC: Authorization failures expose machine-readable structured reasons.
 test('exposes structured reasons for session and plan preconditions', () => {
-  const unbound = assert.throws(() =>
+  const unbound = capture(() =>
     service({ role: 'planner', state: 'PLANNING', sessionBound: false }).submitPlan(change),
   );
   assert.equal(reason(unbound), 'SESSION_NOT_BOUND');
   assert.equal(unbound.details.reason, 'SESSION_NOT_BOUND');
 
-  const unaccepted = assert.throws(() =>
+  const unaccepted = capture(() =>
     service({ role: 'worker', state: 'PROOF', planAccepted: false }).submitProof(change),
   );
   assert.equal(reason(unaccepted), 'PLAN_NOT_ACCEPTED');
