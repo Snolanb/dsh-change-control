@@ -1,0 +1,5 @@
+node_modules/
+changes.json
+.portable-*.json
+*.log
+.DS_Store
