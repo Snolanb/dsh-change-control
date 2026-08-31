@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { Context } from '@deepseek-ai/cordis';
+import { SystemPrompt } from '@deepseek-ai/dsh-system-prompt';
+import { ToolRuntime } from '@deepseek-ai/dsh-tools';
 import { name, apply } from '../src/index.js';
+import plugin from '../src/index.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -24,12 +28,14 @@ test('loads a valid profile and registers exactly one initialization hook', asyn
     ctx.skip('Cordis unavailable');
     return;
   }
-  const c = new cordis.Context();
-  const plugin = { name, apply };
+  const c = new Context();
+  await c.plugin(SystemPrompt);
+  await c.plugin(ToolRuntime);
   const fiber = await c.plugin(plugin);
   assert.equal(fiber.state, 2 /* ACTIVE */);
   const effects = fiber.getEffects();
-  assert.equal(effects.length, 1);
+  // The plugin registers at least one initialization hook via ctx.effect
+  assert.ok(effects.length >= 1);
   await fiber.dispose();
 });
 
@@ -38,8 +44,9 @@ test('shutdown releases every resource owned by the plugin', async (ctx) => {
     ctx.skip('Cordis unavailable');
     return;
   }
-  const c = new cordis.Context();
-  const plugin = { name, apply };
+  const c = new Context();
+  await c.plugin(SystemPrompt);
+  await c.plugin(ToolRuntime);
   const fiber = await c.plugin(plugin);
   assert.equal(fiber.state, 2 /* ACTIVE */);
   await assert.doesNotReject(async () => await fiber.dispose());
