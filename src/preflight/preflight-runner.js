@@ -13,7 +13,7 @@ export class PreflightRunner {
   /**
    * @param {import('../storage/change-store.js').ChangeStore} store
    * @param {object} options
-   * @param {Array<string>} options.requiredChecks — check names
+   * @param {Array<string|object>} options.requiredChecks — check names or definition objects
    * @param {string[]} [options.protectedPaths=[]]
    */
   constructor(store, { requiredChecks, protectedPaths = [] } = {}) {
@@ -75,11 +75,13 @@ export class PreflightRunner {
     }
 
     // 5. Required-checks filtering: only run checks whose name is in the
-    //    host-owned requiredChecks list.
+    //    host-owned requiredChecks list. Supports both string names and object definitions.
     const filtered = this.#requiredChecks
-      .map((name) => {
+      .map((entry) => {
+        const name = typeof entry === 'string' ? entry : entry.name;
+        const defaultCheck = typeof entry === 'object' && entry.command ? { ...entry, passed: false, exitCode: 1 } : { name, passed: false, exitCode: 1 };
         const result = (checkResults ?? []).find((r) => r.name === name);
-        return result ?? { name, passed: false, exitCode: 1 };
+        return result ?? defaultCheck;
       });
 
     // 6. Any failure blocks REVIEW and is durable (state stays PREFLIGHT).

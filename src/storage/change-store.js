@@ -155,7 +155,7 @@ export class ChangeStore {
   #preflightResults = new Map();
   /** @type {Set<string>} Keys of locally mutated bindings (changeId:sessionId) */
   #dirtyBindings = new Set();
-  /** @type {{requiredChecks: string[], protectedPaths: string[]} | null} */
+  /** @type {{requiredChecks: Array<string|object>, protectedPaths: string[]} | null} */
   #preflightPolicy = null;
 
   constructor(file, { preflightPolicy } = {}) {
