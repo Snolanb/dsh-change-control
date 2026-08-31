@@ -104,7 +104,7 @@ const TOOL_CONTRACT = Object.freeze([
   { name: 'change_submit_plan',    action: 'submitPlan',    argKey: 'content',  argType: 'object', authRoles: ['planner'],   authStates: ['DRAFT', 'PLANNED'], nextState: 'PLANNED',  description: 'Submit a plan for a Change. Requires planner role on DRAFT/PLANNED change.' },
   { name: 'change_submit_proof',   action: 'submitProof',   argKey: 'proof',    argType: 'string',  authRoles: ['worker'],    authStates: ['IMPLEMENTING'],    nextState: 'PREFLIGHT', description: 'Submit proof of implementation. Requires worker role on IMPLEMENTING change.' },
   { name: 'change_submit_review',  action: 'submitReview',  argKey: 'review',   argType: 'string',  authRoles: ['reviewer'],  authStates: ['PREFLIGHT'],       nextState: 'REVIEW',   description: 'Submit a review for a Change. Requires reviewer role on PREFLIGHT change.' },
-  { name: 'change_submit_repair',  action: 'submitRepair',  argKey: 'repair',   argType: 'string',  authRoles: ['worker'],    authStates: ['REVIEW'],          nextState: 'PREFLIGHT',description: 'Submit a repair after review. Requires worker role on REVIEW change.' },
+  { name: 'change_submit_repair',  action: 'submitRepair',  argKey: 'repair',   argType: 'string',  authRoles: ['worker'],    authStates: ['REVIEW'],          nextState: 'REPAIR',    description: 'Submit a repair after review. Requires worker role on REVIEW change.' },
 ]);
 
 /**

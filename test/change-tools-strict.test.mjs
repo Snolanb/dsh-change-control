@@ -73,3 +73,61 @@ test('all five tools are registered and have bounded parameter schemas', () => f
     assert.equal(typeof definition.execute, 'function');
   }
 }));
+
+test('full legal lifecycle executes all five tools with exact state/audit evidence', () => fixture(async ({ store, change, registry }) => {
+  // Bind roles
+  await store.bindRole(change.id, 'planner-session', 'planner');
+  await store.bindRole(change.id, 'worker-session', 'worker');
+  await store.bindRole(change.id, 'reviewer-session', 'reviewer');
+
+  const before = (await store.history(change.id)).length;
+
+  // 1. Plan: DRAFT → PLANNED
+  const plan = await call(registry, 'change_submit_plan', { changeId: change.id, content: { steps: ['a'] } }, 'planner-session');
+  assert.equal(plan.isError, false);
+  assert.ok(plan.value?.planId);
+
+  // Accept plan and transition to IMPLEMENTING
+  await store.acceptPlan(change.id, plan.value.planId, { authorized: true });
+  assert.equal((await store.get(change.id)).state, 'READY');
+  await store.transition(change.id, 'IMPLEMENTING');
+  assert.equal((await store.get(change.id)).state, 'IMPLEMENTING');
+
+  // 2. Proof: IMPLEMENTING → PREFLIGHT
+  const proof = await call(registry, 'change_submit_proof', { changeId: change.id, proof: 'tests pass' }, 'worker-session');
+  assert.equal(proof.isError, false);
+  assert.equal(proof.value?.success, true);
+  assert.equal((await store.get(change.id)).state, 'PREFLIGHT');
+
+  // 3. Review: PREFLIGHT → REVIEW
+  const review = await call(registry, 'change_submit_review', { changeId: change.id, review: 'looks good' }, 'reviewer-session');
+  assert.equal(review.isError, false);
+  assert.equal(review.value?.success, true);
+  assert.equal((await store.get(change.id)).state, 'REVIEW');
+
+  // 4. Repair: REVIEW → REPAIR
+  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: 'fixed it' }, 'worker-session');
+  assert.equal(repair.isError, false);
+  assert.equal(repair.value?.success, true);
+  assert.equal((await store.get(change.id)).state, 'REPAIR');
+
+  // Transition REPAIR → PREFLIGHT for re-review
+  await store.transition(change.id, 'PREFLIGHT');
+  assert.equal((await store.get(change.id)).state, 'PREFLIGHT');
+
+  // 5. Re-review: PREFLIGHT → REVIEW
+  const review2 = await call(registry, 'change_submit_review', { changeId: change.id, review: 'again' }, 'reviewer-session');
+  assert.equal(review2.isError, false);
+  assert.equal(review2.value?.success, true);
+  assert.equal((await store.get(change.id)).state, 'REVIEW');
+
+  // Verify audit evidence
+  const after = (await store.history(change.id)).length;
+  assert.ok(after > before, 'History should have appended events');
+  const history = await store.history(change.id);
+  const states = history.map(h => h.to);
+  assert.ok(states.includes('PLANNED'));
+  assert.ok(states.includes('PREFLIGHT'));
+  assert.ok(states.includes('REVIEW'));
+  assert.ok(states.includes('REPAIR'));
+}));
