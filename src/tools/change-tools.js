@@ -2,6 +2,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { ChangeService, AuthorizationError } from '../change-control.js';
 import { ChangeStore } from '../storage/change-store.js';
+import { TRANSITIONS } from '../domain/change.js';
 
 /**
  * @typedef {object} Identity
@@ -55,37 +56,56 @@ async function deriveIdentity(args, exec, store) {
 }
 
 /**
+ * Wrap a store.transition call, converting domain errors to structured tool errors.
+ * @param {object} store
+ * @param {string} changeId
+ * @param {string} nextState
+ * @returns {Promise<object>}
+ */
+async function transitionWithStructure(store, changeId, nextState) {
+  try {
+    return await store.transition(changeId, nextState);
+  } catch (err) {
+    if (err.code === 'ILLEGAL_TRANSITION' || err.message?.includes('not legal')) {
+      // Get current state and allowed next states
+      const change = await store.get(changeId);
+      const allowed = TRANSITIONS[change.state] ?? [];
+      throw Object.assign(new Error(`Cannot transition from ${change.state} to ${nextState}`), {
+        code: 'ILLEGAL_TRANSITION',
+        current: change.state,
+        attempted: nextState,
+        allowed,
+      });
+    }
+    throw err;
+  }
+}
+
+/**
  * Map domain state to authorization state for ChangeService.
- * Derives from canonical domain, no hardcoded remap in tool layer.
+ * Single source of truth for state translation.
  * @param {string} domainState
  * @returns {string}
  */
 function toAuthState(domainState) {
-  // DRAFT and PLANNED are both valid pre-plan states; map to PLANNING for authorization
   if (domainState === 'DRAFT' || domainState === 'PLANNED') return 'PLANNING';
-  // READY maps to PROOF for proof submission
-  if (domainState === 'READY') return 'PROOF';
-  // IMPLEMENTING also maps to PROOF for proof submission
   if (domainState === 'IMPLEMENTING') return 'PROOF';
-  // PREFLIGHT maps to REVIEW for review submission
   if (domainState === 'PREFLIGHT') return 'REVIEW';
-  // REVIEW maps to REPAIR for repair submission
   if (domainState === 'REVIEW') return 'REPAIR';
   return domainState;
 }
 
 /**
- * Get the next state after a tool operation based on canonical TRANSITIONS.
- * @param {object} store
- * @param {string} changeId
- * @param {string} currentDomainState
- * @returns {string}
+ * Define the tool contract: auth state, next state, arg key, and description for each operation.
+ * Single source of truth aligned with canonical TRANSITIONS.
+ * @type {ReadonlyArray<{name: string, action: string, argKey: string, argType: string, authRoles: string[], authStates: string[], nextState: string, description: string}>}
  */
-function getNextState(store, changeId, currentDomainState) {
-  // The transition is determined by the operation type, not hardcoded per tool
-  // This is handled by the store.transition() call with the correct target
-  return currentDomainState;
-}
+const TOOL_CONTRACT = Object.freeze([
+  { name: 'change_submit_plan',    action: 'submitPlan',    argKey: 'content',  argType: 'object', authRoles: ['planner'],   authStates: ['DRAFT', 'PLANNED'], nextState: 'PLANNED',  description: 'Submit a plan for a Change. Requires planner role on DRAFT/PLANNED change.' },
+  { name: 'change_submit_proof',   action: 'submitProof',   argKey: 'proof',    argType: 'string',  authRoles: ['worker'],    authStates: ['IMPLEMENTING'],    nextState: 'PREFLIGHT', description: 'Submit proof of implementation. Requires worker role on IMPLEMENTING change.' },
+  { name: 'change_submit_review',  action: 'submitReview',  argKey: 'review',   argType: 'string',  authRoles: ['reviewer'],  authStates: ['PREFLIGHT'],       nextState: 'REVIEW',   description: 'Submit a review for a Change. Requires reviewer role on PREFLIGHT change.' },
+  { name: 'change_submit_repair',  action: 'submitRepair',  argKey: 'repair',   argType: 'string',  authRoles: ['worker'],    authStates: ['REVIEW'],          nextState: 'PREFLIGHT',description: 'Submit a repair after review. Requires worker role on REVIEW change.' },
+]);
 
 /**
  * Factory to create tools with a bound store
@@ -107,7 +127,6 @@ export function createChangeTools(store) {
       render: (_args, value) => value,
     },
     execute: async (args, exec) => {
-      // Validate before identity check
       validateChangeId(args.changeId);
       const { sessionId, role } = await deriveIdentity(args, exec, store);
 
@@ -117,174 +136,67 @@ export function createChangeTools(store) {
   });
 
   /**
-   * Create change_submit_plan tool
+   * Create submit tools from TOOL_CONTRACT
    */
-  const changeSubmitPlanTool = defineTool({
-    name: 'change_submit_plan',
-    description: 'Submit a plan for a Change. Requires planner role on DRAFT/PLANNED change.',
-    parameters: {
-      changeId: { type: 'string' },
-      content: { type: 'object', additionalProperties: true },
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => value,
-    },
-    execute: async (args, exec) => {
-      // Validate before identity check
-      validateChangeId(args.changeId);
-      if (!args.content || typeof args.content !== 'object') {
-        throw Object.assign(new Error('content is required and must be an object'), { code: 'INVALID_CONTENT' });
-      }
-      const { sessionId, role } = await deriveIdentity(args, exec, store);
+  const submitTools = TOOL_CONTRACT.map(({ name, action, argKey, argType, authRoles, authStates, nextState, description }) => {
+    return defineTool({
+      name,
+      description,
+      parameters: {
+        changeId: { type: 'string' },
+        [argKey]: { type: argType, ...(argType === 'object' ? { additionalProperties: true } : {}) },
+      },
+      output: {
+        schema: { type: 'object', additionalProperties: true },
+        render: (_args, value) => value,
+      },
+      execute: async (args, exec) => {
+        validateChangeId(args.changeId);
 
-      const change = await store.get(args.changeId);
-      const authState = toAuthState(change.state);
-      const service = new ChangeService({ role: role || 'planner', state: authState, sessionBound: true });
-      try {
-        service.submitPlan({ changeId: args.changeId });
-      } catch (err) {
-        if (err instanceof AuthorizationError) {
-          throw Object.assign(new Error(err.message), { code: err.reason, details: err.details });
+        // Validate payload exists
+        if (!args[argKey]) {
+          throw Object.assign(new Error(`${argKey} is required`), { code: `INVALID_${argKey.toUpperCase()}` });
         }
-        throw err;
-      }
 
-      const plan = await store.submitPlan(args.changeId, args.content);
-      return { planId: plan.id, status: plan.status };
-    },
+        const { sessionId, role } = await deriveIdentity(args, exec, store);
+        const change = await store.get(args.changeId);
+
+        // Authorize using canonical auth states (aligned with TRANSITIONS)
+        if (!authStates.includes(change.state)) {
+          throw new AuthorizationError('INVALID_CHANGE_STATE',
+            `${role} cannot ${action} in ${change.state}`);
+        }
+        if (!authRoles.includes(role)) {
+          throw new AuthorizationError('ROLE_NOT_ALLOWED',
+            `${role} cannot ${action}`);
+        }
+
+        // Perform the operation via ChangeService
+        const service = new ChangeService({ role, state: toAuthState(change.state), sessionBound: true });
+        try {
+          service[action]({ changeId: args.changeId });
+        } catch (err) {
+          if (err instanceof AuthorizationError) {
+            throw Object.assign(new Error(err.message), { code: err.reason, details: err.details });
+          }
+          throw err;
+        }
+
+        // Delegate to store for the actual operation
+        let result;
+        if (action === 'submitPlan') {
+          result = await store.submitPlan(args.changeId, args[argKey]);
+          return { planId: result.id, status: result.status };
+        }
+
+        // For proof/review/repair, transition to the next state
+        await transitionWithStructure(store, args.changeId, nextState);
+        return { success: true };
+      },
+    });
   });
 
-  /**
-   * Create change_submit_proof tool
-   */
-  const changeSubmitProofTool = defineTool({
-    name: 'change_submit_proof',
-    description: 'Submit proof of implementation. Requires worker role on IMPLEMENTING change.',
-    parameters: {
-      changeId: { type: 'string' },
-      proof: { type: 'string' },
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => value,
-    },
-    execute: async (args, exec) => {
-      // Validate before identity check
-      validateChangeId(args.changeId);
-      if (!args.proof || typeof args.proof !== 'string') {
-        throw Object.assign(new Error('proof is required and must be a string'), { code: 'INVALID_PROOF' });
-      }
-      const { sessionId, role } = await deriveIdentity(args, exec, store);
-
-      const change = await store.get(args.changeId);
-      // Map domain state to auth state: IMPLEMENTING → PROOF
-      const authState = toAuthState(change.state);
-      const service = new ChangeService({ role: role || 'worker', state: authState, sessionBound: true });
-      try {
-        service.submitProof({ changeId: args.changeId });
-      } catch (err) {
-        if (err instanceof AuthorizationError) {
-          throw Object.assign(new Error(err.message), { code: err.reason, details: err.details });
-        }
-        throw err;
-      }
-
-      // Transition to PREFLIGHT per canonical TRANSITIONS (IMPLEMENTING → PREFLIGHT)
-      await store.transition(args.changeId, 'PREFLIGHT');
-      return { success: true };
-    },
-  });
-
-  /**
-   * Create change_submit_review tool
-   */
-  const changeSubmitReviewTool = defineTool({
-    name: 'change_submit_review',
-    description: 'Submit a review for a Change. Requires reviewer role on PREFLIGHT change.',
-    parameters: {
-      changeId: { type: 'string' },
-      review: { type: 'string' },
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => value,
-    },
-    execute: async (args, exec) => {
-      // Validate before identity check
-      validateChangeId(args.changeId);
-      if (!args.review || typeof args.review !== 'string') {
-        throw Object.assign(new Error('review is required and must be a string'), { code: 'INVALID_REVIEW' });
-      }
-      const { sessionId, role } = await deriveIdentity(args, exec, store);
-
-      const change = await store.get(args.changeId);
-      // Map domain state to auth state: PREFLIGHT → REVIEW
-      const authState = toAuthState(change.state);
-      const service = new ChangeService({ role: role || 'reviewer', state: authState, sessionBound: true });
-      try {
-        service.submitReview({ changeId: args.changeId });
-      } catch (err) {
-        if (err instanceof AuthorizationError) {
-          throw Object.assign(new Error(err.message), { code: err.reason, details: err.details });
-        }
-        throw err;
-      }
-
-      // Transition to REVIEW per canonical TRANSITIONS (PREFLIGHT → REVIEW)
-      await store.transition(args.changeId, 'REVIEW');
-      return { success: true };
-    },
-  });
-
-  /**
-   * Create change_submit_repair tool
-   */
-  const changeSubmitRepairTool = defineTool({
-    name: 'change_submit_repair',
-    description: 'Submit a repair after review. Requires worker role on REVIEW change.',
-    parameters: {
-      changeId: { type: 'string' },
-      repair: { type: 'string' },
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => value,
-    },
-    execute: async (args, exec) => {
-      // Validate before identity check
-      validateChangeId(args.changeId);
-      if (!args.repair || typeof args.repair !== 'string') {
-        throw Object.assign(new Error('repair is required and must be a string'), { code: 'INVALID_REPAIR' });
-      }
-      const { sessionId, role } = await deriveIdentity(args, exec, store);
-
-      const change = await store.get(args.changeId);
-      // Map domain state to auth state: REVIEW → REPAIR
-      const authState = toAuthState(change.state);
-      const service = new ChangeService({ role: role || 'worker', state: authState, sessionBound: true });
-      try {
-        service.submitRepair({ changeId: args.changeId });
-      } catch (err) {
-        if (err instanceof AuthorizationError) {
-          throw Object.assign(new Error(err.message), { code: err.reason, details: err.details });
-        }
-        throw err;
-      }
-
-      // Transition to PREFLIGHT per canonical TRANSITIONS (REPAIR → PREFLIGHT)
-      await store.transition(args.changeId, 'PREFLIGHT');
-      return { success: true };
-    },
-  });
-
-  return [
-    changeGetTool,
-    changeSubmitPlanTool,
-    changeSubmitProofTool,
-    changeSubmitReviewTool,
-    changeSubmitRepairTool,
-  ];
+  return [changeGetTool, ...submitTools];
 }
 
 /**
