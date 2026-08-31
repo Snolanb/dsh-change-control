@@ -30,7 +30,6 @@ async function apply(ctx, config) {
   const service = new ChangeService({
     role: config?.role || 'planner',
     state: config?.state || 'PLANNING',
-    store: store,
   });
   persistentService = service;
   ctx.effect(() => {

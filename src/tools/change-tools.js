@@ -5,6 +5,7 @@
  * delegates to canonical ChangeService (authorization) and ChangeStore (persistence).
  */
 import { defineTool } from '@deepseek-ai/dsh-tools';
+import { AuthorizationError } from '../change-control.js';
 
 /**
  * Map tool names to canonical service/store method names.
@@ -97,24 +98,34 @@ export function registerChangeTools(ctx) {
           }
           // Authorization check via canonical ChangeService
           await service.get(change);
+          // Verify session binding — fail closed when identity present but no binding store
+          if (sessionId && service.verifyBinding) {
+            const bound = await service.verifyBinding(params.changeId, sessionId);
+            if (!bound) {
+              throw new AuthorizationError('SESSION_NOT_BOUND', 'Session is not bound to this change');
+            }
+          }
           // Read from canonical store
           return await store.get(params.changeId);
         }
 
         // Mutation operations: authorize via ChangeService, persist via ChangeStore
         if (!service || typeof service[handler] !== 'function') {
-          const err = new Error(`Service method ${handler} not available`);
-          err.code = 'INVALID_ARGS';
-          throw err;
+          throw new AuthorizationError('INVALID_ARGS', `Service method ${handler} not available`);
         }
         if (!store || typeof store[handler] !== 'function') {
-          const err = new Error(`Store method ${handler} not available`);
-          err.code = 'INVALID_ARGS';
-          throw err;
+          throw new AuthorizationError('INVALID_ARGS', `Store method ${handler} not available`);
         }
 
         // Authorization check via canonical ChangeService
         await service[handler](change);
+        // Verify session binding for mutations
+        if (sessionId && service.verifyBinding) {
+          const bound = await service.verifyBinding(params.changeId, sessionId);
+          if (!bound) {
+            throw new AuthorizationError('SESSION_NOT_BOUND', 'Session is not bound to this change');
+          }
+        }
 
         // Persistence via canonical ChangeStore (takes changeId, content)
         const result = await store[handler](params.changeId, params.content);

@@ -30,22 +30,24 @@ export class AuthorizationError extends Error {
 
 /** @type {ReadonlyArray<{action: string, roles: readonly string[], states: readonly string[], planRequired?: boolean}>} */
 const ACTIONS = Object.freeze([
+  { action: 'get',           roles: ['planner', 'worker', 'reviewer'], states: ['PLANNING', 'READY', 'IMPLEMENTING', 'PROOF', 'REPAIR', 'REVIEW', 'DONE'], planRequired: false },
   { action: 'submitPlan',    roles: ['planner'],     states: ['PLANNING'],      planRequired: false },
   { action: 'acceptPlan',    roles: ['reviewer'],    states: ['PLANNING'],      planRequired: false },
-  { action: 'submitProof',   roles: ['worker'],      states: ['PROOF'],         planRequired: true  },
-  { action: 'submitRepair',  roles: ['worker'],      states: ['REPAIR'],        planRequired: true  },
+  { action: 'submitProof',   roles: ['worker'],      states: ['IMPLEMENTING', 'PROOF'], planRequired: true  },
+  { action: 'submitRepair',  roles: ['worker'],      states: ['REPAIR'],                planRequired: true  },
   { action: 'submitReview',  roles: ['reviewer'],    states: ['REVIEW'],        planRequired: false },
 ]);
 
 // ─── Service ──────────────────────────────────────────────────────────────────
 
 /**
- * Minimal authorization service.
+ * Minimal authorization service with optional binding-aware identity enforcement.
  * @param {object} ctx
  * @param {string} ctx.role       'planner' | 'worker' | 'reviewer'
  * @param {string} ctx.state      Current semantic state
  * @param {boolean} [ctx.sessionBound=true]
  * @param {boolean} [ctx.planAccepted=true]
+ * @param {object} [ctx.store]    ChangeStore for binding verification
  */
 export class ChangeService {
   /** @type {string} */
@@ -56,13 +58,42 @@ export class ChangeService {
   #sessionBound;
   /** @type {boolean} */
   #planAccepted;
+  /** @type {object|null} */
+  #store;
 
-  /** @param {{role: string, state: string, sessionBound?: boolean, planAccepted?: boolean}} ctx */
-  constructor({ role, state, sessionBound = true, planAccepted = true }) {
+  /** @param {{role: string, state: string, sessionBound?: boolean, planAccepted?: boolean, store?: object|null}} ctx */
+  constructor({ role, state, sessionBound = true, planAccepted = true, store = null }) {
     this.#role = role;
     this.#state = state;
     this.#sessionBound = sessionBound;
     this.#planAccepted = planAccepted;
+    this.#store = store;
+  }
+
+  /**
+   * Verify session binding to change via store, including role match.
+   * @param {string} changeId
+   * @param {string} sessionId
+   * @returns {Promise<boolean>}
+   */
+  async #verifyBinding(changeId, sessionId) {
+    /** @type {any} */
+    const store = this.#store;
+    if (!store || typeof store.resolveRole !== 'function') return true;
+    try {
+      const bindingRole = await store.resolveRole(changeId, sessionId);
+      return bindingRole === this.#role;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Get the configured role.
+   * @returns {string}
+   */
+  getRole() {
+    return this.#role;
   }
 
   /**
@@ -89,6 +120,33 @@ export class ChangeService {
     return change ?? {};
   }
 
+  /**
+   * Verify session binding to change via store, including role match.
+   * Fails closed when identity is present but no binding-capable store exists.
+   * @param {string} changeId
+   * @param {string} sessionId
+   * @returns {Promise<boolean>}
+   */
+  async verifyBinding(changeId, sessionId) {
+    /** @type {any} */
+    const store = this.#store;
+    // Fail closed: if identity is present but no store to verify against, reject
+    if (!store || typeof store.resolveRole !== 'function') {
+      return false;
+    }
+    try {
+      /** @type {string|null} */
+      const bindingRole = await store.resolveRole(changeId, sessionId);
+      // Check that the persisted binding role matches our configured role
+      if (bindingRole !== this.#role) {
+        return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** @param {object} change */
   submitPlan(change)      { return this.#authorize('submitPlan', change); }
   /** @param {object} change */
@@ -99,4 +157,6 @@ export class ChangeService {
   submitRepair(change)    { return this.#authorize('submitRepair', change); }
   /** @param {object} change */
   submitReview(change)    { return this.#authorize('submitReview', change); }
+  /** @param {object} change */
+  get(change)             { return this.#authorize('get', change); }
 }
