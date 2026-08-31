@@ -151,17 +151,27 @@ export class ChangeStore {
   #attempts = new Map();
   /** @type {Map<string, object>} changeId -> proof bundle */
   #proofs = new Map();
+  /** @type {Map<string, Array>} changeId -> controller preflight results */
+  #preflightResults = new Map();
   /** @type {Set<string>} Keys of locally mutated bindings (changeId:sessionId) */
   #dirtyBindings = new Set();
+  /** @type {{requiredChecks: string[], protectedPaths: string[]} | null} */
+  #preflightPolicy = null;
 
-  constructor(file) {
+  constructor(file, { preflightPolicy } = {}) {
     this.#file = canonicalPath(file);
     this.#changes = new Map();
     this.#audit = [];
+    if (preflightPolicy) {
+      this.#preflightPolicy = {
+        requiredChecks: Array.isArray(preflightPolicy.requiredChecks) ? preflightPolicy.requiredChecks : [],
+        protectedPaths: Array.isArray(preflightPolicy.protectedPaths) ? preflightPolicy.protectedPaths : [],
+      };
+    }
   }
 
-  static async open(file) {
-    const store = new ChangeStore(file);
+  static async open(file, options = {}) {
+    const store = new ChangeStore(file, options);
     await store.#load();
     return store;
   }
@@ -182,9 +192,13 @@ export class ChangeStore {
       if (!idx.has(e.changeId)) idx.set(e.changeId, []);
       idx.get(e.changeId).push(e);
     }
-    this.#changes = new Map(
-      (data.changes ?? []).map((c) => [c.id, rehydrate(c, idx.get(c.id) ?? [])])
-    );
+    this.#changes = new Map();
+    for (const c of data.changes ?? []) {
+      const ch = rehydrate(c, idx.get(c.id) ?? []);
+      if (c.requiredChecks) ch._requiredChecks = c.requiredChecks;
+      if (c.controllerPreflightResults) ch._controllerPreflightResults = c.controllerPreflightResults;
+      this.#changes.set(c.id, ch);
+    }
     this.#audit = Array.isArray(data.audit) ? data.audit : [];
     // Plans are serialised inline inside change records as a "plans" array (append-only).
     if (data.plans && Array.isArray(data.plans)) {
@@ -208,6 +222,12 @@ export class ChangeStore {
     if (data.proofs && typeof data.proofs === 'object') {
       for (const [changeId, proof] of Object.entries(data.proofs)) {
         this.#proofs.set(changeId, proof);
+      }
+    }
+    // Preflight results: keyed by changeId.
+    if (data.preflightResults && typeof data.preflightResults === 'object') {
+      for (const [changeId, results] of Object.entries(data.preflightResults)) {
+        this.#preflightResults.set(changeId, results);
       }
     }
   }
@@ -301,6 +321,8 @@ export class ChangeStore {
           domainState: c._getDomainState?.() ?? c.state,
           createdAt: c.createdAt,
           updatedAt: c.updatedAt,
+          requiredChecks: c._requiredChecks ?? null,
+          controllerPreflightResults: c._controllerPreflightResults ?? null,
         });
       } else if (diskRec) {
         // Preserve all lifecycle fields from disk; only overlay mutable scalars.
@@ -311,6 +333,8 @@ export class ChangeStore {
           acceptanceCriteria: c.acceptanceCriteria,
           risk: c.risk,
           updatedAt: c.updatedAt,
+          requiredChecks: c._requiredChecks ?? diskRec.requiredChecks ?? null,
+          controllerPreflightResults: c._controllerPreflightResults ?? diskRec.controllerPreflightResults ?? null,
         });
       }
     }
@@ -368,8 +392,16 @@ export class ChangeStore {
       mergedProofs[changeId] = proof;
     }
 
+    // Merge preflight results: union by changeId, prefer local.
+    const diskPreflightResults = diskData?.preflightResults && typeof diskData.preflightResults === 'object' ? diskData.preflightResults : {};
+    const mergedPreflightResults = { ...diskPreflightResults };
+    for (const [changeId, results] of this.#preflightResults) {
+      mergedPreflightResults[changeId] = results;
+    }
+
     await writeJson(this.#file, {
-      changes: [...mergedChanges.values()],
+      changes: [...mergedChanges.values().filter((c) => c)],
+      preflightResults: mergedPreflightResults,
       audit: mergedAudit,
       // Plans are kept as a top-level array for direct retrieval.
       plans: [...mergedPlans.values()],
@@ -978,5 +1010,206 @@ export class ChangeStore {
     } finally {
       release();
     }
+  }
+
+  // ─── Required Checks Configuration ────────────────────────────────────────
+
+  /**
+   * Host-owned required-checks configuration for a change.
+   * Workers cannot modify this via ordinary writes.
+   * @param {string} changeId
+   * @param {Array<{name: string, command?: string, env?: object, cwd?: string}>} checks
+   * @param {{workerId?: string}} [opts]
+   */
+  async setRequiredChecks(changeId, checks, opts = {}) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      // Guard: only host (no workerId) may write required-checks config.
+      if (opts.workerId) {
+        throw Object.assign(new Error('Worker-facing writes cannot alter host-required check configuration'), { code: 'FORBIDDEN' });
+      }
+      // Store requiredChecks alongside the change record.
+      if (!c._requiredChecks) c._requiredChecks = [];
+      c._requiredChecks = structuredClone(checks);
+      await this.#persist();
+      return structuredClone(c._requiredChecks);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Retrieve required-checks configuration for a change.
+   * @param {string} changeId
+   * @returns {Array<object>|null}
+   */
+  async getRequiredChecks(changeId) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      return c._requiredChecks ? structuredClone(c._requiredChecks) : null;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Invalidate stored proof when workspace revision drifts.
+   * @param {string} changeId
+   */
+  async invalidateProof(changeId) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      // Tombstone the proof so #persist cannot merge the older disk value back.
+      // A null entry remains durable and makes getProof report NOT_FOUND after reopen.
+      this.#proofs.set(changeId, null);
+      await this.#persist();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Run preflight verification using the configured preflight policy.
+   * Host-owned entry point that delegates to PreflightRunner logic.
+   * @param {string} changeId
+   * @param {object} params
+   * @param {string} params.currentRevision
+   * @param {string[]} params.changedFiles
+   * @param {Array} params.checkResults
+   * @returns {Promise<{allowed: boolean, results: object[], state: string}>}
+   */
+  async runPreflight(changeId, { currentRevision, changedFiles, checkResults } = {}) {
+    const policy = this.#preflightPolicy;
+    if (!policy || !policy.requiredChecks || policy.requiredChecks.length === 0) {
+      throw Object.assign(new Error('No preflight policy configured for this store'), { code: 'NO_POLICY' });
+    }
+
+    // 1. Load the change and verify it is in PREFLIGHT.
+    const change = await this.get(changeId);
+    if (change.state !== 'PREFLIGHT') {
+      throw Object.assign(
+        new Error(`Change ${changeId} is in ${change.state}, expected PREFLIGHT`),
+        { code: 'INVALID_STATE', changeId }
+      );
+    }
+
+    // 2. Load the proof bundle — mandatory for preflight to succeed.
+    let proof;
+    try {
+      proof = await this.getProof(changeId);
+    } catch (err) {
+      if (err.code === 'NOT_FOUND') {
+        throw Object.assign(new Error(`No proof bundle found for change ${changeId}`), { code: 'NO_PROOF', changeId });
+      }
+      throw err;
+    }
+
+    // 3. Staleness check: workspace revision must match proof.afterRevision.
+    if (proof.afterRevision !== currentRevision) {
+      throw Object.assign(
+        new Error(`Proof stale: afterRevision=${proof.afterRevision}, currentRevision=${currentRevision}`),
+        { code: 'STALE_PROOF', changeId, afterRevision: proof.afterRevision, currentRevision }
+      );
+    }
+
+    // 4. Protected-path check.
+    const violation = (changedFiles ?? []).find((f) => (policy.protectedPaths ?? []).includes(f));
+    if (violation) {
+      throw Object.assign(
+        new Error(`Protected path changed: ${violation}`),
+        { code: 'PROTECTED_PATH_CHANGED', changeId, protectedPath: violation }
+      );
+    }
+
+    // 5. Required-checks filtering using host-owned requiredChecks.
+    const filtered = (policy.requiredChecks ?? [])
+      .map((name) => {
+        const result = (checkResults ?? []).find((r) => r.name === name);
+        return result ?? { name, passed: false, exitCode: 1 };
+      });
+
+    // 6. Any failure blocks REVIEW.
+    const failed = filtered.filter((r) => !r.passed);
+    if (failed.length > 0) {
+      throw Object.assign(
+        new Error(`Required checks failed: ${failed.map((r) => r.name).join(', ')}`),
+        { code: 'REQUIRED_CHECK_FAILURE', changeId, failedChecks: failed }
+      );
+    }
+
+    // 7. Persist controller results separately from proof.workerChecks.
+    const persistedResults = filtered.map((r) => ({
+      name: r.name,
+      passed: r.passed,
+      exitCode: r.exitCode ?? 0,
+      output: r.output ?? null,
+    }));
+
+    this.#preflightResults.set(changeId, persistedResults);
+    await this.#persist();
+
+    // 8. Transition PREFLIGHT → REVIEW via store transition method.
+    await this.transition(changeId, 'REVIEW');
+
+    return {
+      allowed: true,
+      state: 'REVIEW',
+      preflight: { controllerResults: persistedResults, status: 'PASSED' },
+    };
+  }
+
+  /**
+   * Get preflight status for a change.
+   * @param {string} changeId
+   * @returns {Promise<object|null>}
+   */
+  async getPreflight(changeId) {
+    const change = await this.get(changeId);
+    if (change.state !== 'REVIEW' && change.state !== 'PREFLIGHT') {
+      return null;
+    }
+    const results = this.#preflightResults.get(changeId);
+    if (!results) return null;
+    return {
+      allowed: true,
+      state: change.state,
+      controllerResults: results,
+    };
+  }
+
+  /**
+   * Internal-only: store preflight results for a change.
+   * @internal
+   */
+  async _setPreflightResults(changeId, results) {
+    this.#preflightResults.set(changeId, results);
+    await this.#persist();
+  }
+
+  /**
+   * Internal-only: get preflight results for a change.
+   * @internal
+   */
+  async _getPreflightResults(changeId) {
+    const results = this.#preflightResults.get(changeId);
+    return results ? structuredClone(results) : null;
+  }
+
+  /**
+   * Internal-only: persist current in-memory state to disk.
+   * Used by PreflightRunner to commit controller results without going through a public mutation method.
+   * @internal
+   */
+  async _persist() {
+    await this.#persist();
   }
 }

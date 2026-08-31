@@ -1,0 +1,30 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { PreflightRunner } from '../src/preflight/preflight-runner.js';
+import { ChangeStore } from '../src/storage/change-store.js';
+
+const proofFor = (revision = 'rev-1') => ({ beforeRevision: 'rev-0', afterRevision: revision, criteria: [], deviations: [], workerChecks: [{ name: 'worker-test', passed: true }], controllerPreflight: [] });
+const checks = (lint = true) => [{ name: 'lint', command: 'npm run lint', passed: lint, exitCode: lint ? 0 : 1 }, { name: 'tests', command: 'npm test', passed: true, exitCode: 0 }];
+async function setup(t, { proof = true } = {}) {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-preflight-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'changes.json');
+  const store = await ChangeStore.open(file);
+  const change = await store.create({ title: 'Preflight test' }); const plan = await store.submitPlan(change.id, { objective: 'test', steps: ['test'] });
+  await store.acceptPlan(change.id, plan.id, { authorized: true }); await store.transition(change.id, 'IMPLEMENTING'); if (proof) await store.submitProof(change.id, proofFor());
+  return { store, change, file };
+}
+const blocked = (promise) => promise.catch((error) => error);
+
+test('preflight requires a valid proof bundle', async (t) => { const { store, change } = await setup(t, { proof: false }); const runner = new PreflightRunner(store, { requiredChecks: ['lint'] }); const outcome = await blocked(runner.run(change.id, { currentRevision: 'rev-1', changedFiles: [], checkResults: checks() })); assert.ok(outcome instanceof Error || outcome.allowed === false); assert.equal((await store.get(change.id)).state, 'IMPLEMENTING'); });
+test('passing required checks persist and move PREFLIGHT to REVIEW', async (t) => { const { store, change } = await setup(t); const runner = new PreflightRunner(store, { requiredChecks: ['lint', 'tests'] }); const result = await runner.run(change.id, { currentRevision: 'rev-1', changedFiles: [], checkResults: checks() }); assert.deepEqual(result, { allowed: true, results: checks(), state: 'REVIEW' }); assert.deepEqual((await runner.getStatus(change.id)).results, checks()); });
+test('any required failure prevents REVIEW', async (t) => { const { store, change } = await setup(t); const runner = new PreflightRunner(store, { requiredChecks: ['lint', 'tests'] }); const outcome = await blocked(runner.run(change.id, { currentRevision: 'rev-1', changedFiles: [], checkResults: checks(false) })); assert.ok(outcome instanceof Error || outcome.allowed === false); assert.equal((await store.get(change.id)).state, 'PREFLIGHT'); });
+test('workspace revision changes after proof make proof stale', async (t) => { const { store, change } = await setup(t); const runner = new PreflightRunner(store, { requiredChecks: ['lint'] }); const outcome = await blocked(runner.run(change.id, { currentRevision: 'rev-2', changedFiles: [], checkResults: checks() })); assert.ok(outcome instanceof Error || outcome.allowed === false); assert.equal((await store.get(change.id)).state, 'PREFLIGHT'); });
+test('controller results are separate from worker claims', async (t) => { const { store, change } = await setup(t); const runner = new PreflightRunner(store, { requiredChecks: ['lint'] }); const controller = [{ name: 'lint', command: 'npm run lint', passed: true, exitCode: 0 }]; const result = await runner.run(change.id, { currentRevision: 'rev-1', changedFiles: [], checkResults: controller }); assert.deepEqual(result.results, controller); assert.deepEqual((await store.getProof(change.id)).workerChecks, [{ name: 'worker-test', passed: true }]); });
+test('workers cannot override host-owned required checks', async (t) => { const { store, change } = await setup(t); const runner = new PreflightRunner(store, { requiredChecks: ['lint', 'security'] }); const outcome = await blocked(runner.run(change.id, { currentRevision: 'rev-1', changedFiles: [], requiredChecks: ['lint'], checkResults: [{ name: 'lint', command: 'lint', passed: true, exitCode: 0 }] })); assert.ok(outcome instanceof Error || outcome.allowed === false); assert.equal((await store.get(change.id)).state, 'PREFLIGHT'); });
+test('failing commands are caught before reviewer involvement', async (t) => { const { store, change } = await setup(t); const runner = new PreflightRunner(store, { requiredChecks: ['tests'] }); const outcome = await blocked(runner.run(change.id, { currentRevision: 'rev-1', changedFiles: [], checkResults: [{ name: 'tests', command: 'npm test', passed: false, exitCode: 1 }] })); assert.ok(outcome instanceof Error || outcome.allowed === false); assert.notEqual((await store.get(change.id)).state, 'REVIEW'); });
+test('protected paths cannot be changed by preflight', async (t) => { const { store, change } = await setup(t); const runner = new PreflightRunner(store, { requiredChecks: ['lint'], protectedPaths: ['package-lock.json'] }); const outcome = await blocked(runner.run(change.id, { currentRevision: 'rev-1', changedFiles: ['package-lock.json'], checkResults: checks() })); assert.ok(outcome instanceof Error || outcome.allowed === false); assert.equal((await store.get(change.id)).state, 'PREFLIGHT'); });
+
+test('invalidateProof remains effective after reopening the store', async (t) => { const { store, change, file } = await setup(t); await store.invalidateProof(change.id); const reopened = await ChangeStore.open(file); await assert.rejects(() => reopened.getProof(change.id), { code: 'NOT_FOUND' }); });
