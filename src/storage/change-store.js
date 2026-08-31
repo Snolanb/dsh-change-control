@@ -149,6 +149,8 @@ export class ChangeStore {
   #bindings = new Map();
   /** @type {Map<string, Array<{changeId: string, attemptId: string, workerId: string, status: string, recordedAt: string}>>} */
   #attempts = new Map();
+  /** @type {Map<string, object>} changeId -> proof bundle */
+  #proofs = new Map();
   /** @type {Set<string>} Keys of locally mutated bindings (changeId:sessionId) */
   #dirtyBindings = new Set();
 
@@ -202,6 +204,12 @@ export class ChangeStore {
         this.#attempts.get(a.changeId).push(a);
       }
     }
+    // Proofs: keyed by changeId.
+    if (data.proofs && typeof data.proofs === 'object') {
+      for (const [changeId, proof] of Object.entries(data.proofs)) {
+        this.#proofs.set(changeId, proof);
+      }
+    }
   }
 
   /**
@@ -246,6 +254,13 @@ export class ChangeStore {
       for (const a of data.attempts) {
         if (!this.#attempts.has(a.changeId)) this.#attempts.set(a.changeId, []);
         this.#attempts.get(a.changeId).push(a);
+      }
+    }
+    // Reload proofs from disk to preserve records from other instances.
+    if (data.proofs && typeof data.proofs === 'object') {
+      this.#proofs = new Map();
+      for (const [changeId, proof] of Object.entries(data.proofs)) {
+        this.#proofs.set(changeId, proof);
       }
     }
     // NOTE: we do NOT replace this.#audit here — local audit entries are
@@ -353,6 +368,7 @@ export class ChangeStore {
       plans: [...mergedPlans.values()],
       bindings: [...mergedBindings.values()],
       attempts: [...mergedAttempts.values()],
+      proofs: Object.fromEntries(this.#proofs),
     });
     // Clear dirty flags after successful persist.
     this.#dirtyBindings.clear();
@@ -802,6 +818,135 @@ export class ChangeStore {
           this.#attempts.get(a.changeId).push(a);
         }
       }
+    }
+  }
+
+  // ─── Proof Bundle ───────────────────────────────────────────────────────────
+
+  /**
+   * Validate and persist a Proof Bundle for a Change in IMPLEMENTING state.
+   * Transitions the change to PREFLIGHT on success.
+   * @param {string} changeId
+   * @param {object} proof
+   * @param {string} proof.beforeRevision
+   * @param {string} proof.afterRevision
+   * @param {Array<{id: string, satisfied: boolean}>} proof.criteria
+   * @param {Array} [proof.deviations]
+   * @param {Array} proof.workerChecks
+   * @param {Array} proof.controllerPreflight
+   * @returns {{state: string, proof: object}}
+   */
+  async submitProof(changeId, proof) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      if (c.state !== 'IMPLEMENTING') {
+        throw Object.assign(new Error(`Cannot submit proof: change is in ${c.state}, expected IMPLEMENTING`), { code: 'INVALID_STATE' });
+      }
+
+      // ── Validate proof structure ──────────────────────────────────────
+      if (!proof || typeof proof !== 'object') {
+        throw Object.assign(new Error('Proof is required'), { code: 'INVALID_PROOF' });
+      }
+      if (!proof.beforeRevision || typeof proof.beforeRevision !== 'string') {
+        throw Object.assign(new Error('beforeRevision is required'), { code: 'INVALID_PROOF' });
+      }
+      if (!proof.afterRevision || typeof proof.afterRevision !== 'string') {
+        throw Object.assign(new Error('afterRevision is required'), { code: 'INVALID_PROOF' });
+      }
+      if (!Array.isArray(proof.criteria)) {
+        throw Object.assign(new Error('criteria is required and must be an array'), { code: 'INVALID_PROOF' });
+      }
+      if (proof.deviations === undefined || proof.deviations === null) {
+        throw Object.assign(new Error('deviations is required'), { code: 'INVALID_PROOF' });
+      }
+      if (!Array.isArray(proof.deviations)) {
+        throw Object.assign(new Error('deviations must be an array'), { code: 'INVALID_PROOF' });
+      }
+      if (!Array.isArray(proof.workerChecks)) {
+        throw Object.assign(new Error('workerChecks is required'), { code: 'INVALID_PROOF' });
+      }
+      if (!Array.isArray(proof.controllerPreflight)) {
+        throw Object.assign(new Error('controllerPreflight is required'), { code: 'INVALID_PROOF' });
+      }
+
+      // Build the set of accepted criterion IDs from the change
+      const acceptedIds = new Set(c.acceptanceCriteria);
+
+      // Validate each criterion entry: must be an object with string id and boolean satisfied
+      for (const crit of proof.criteria) {
+        if (!crit || typeof crit !== 'object') {
+          throw Object.assign(new Error('Each criterion must be an object'), { code: 'INVALID_PROOF' });
+        }
+        if (typeof crit.id !== 'string') {
+          throw Object.assign(new Error('Criterion id must be a string'), { code: 'INVALID_PROOF' });
+        }
+        if (typeof crit.satisfied !== 'boolean') {
+          throw Object.assign(new Error(`Criterion satisfied must be a boolean for id: ${crit.id}`), { code: 'INVALID_PROOF' });
+        }
+      }
+
+      // Check for unknown criterion IDs
+      for (const crit of proof.criteria) {
+        if (!acceptedIds.has(crit.id)) {
+          throw Object.assign(new Error(`Unknown criterion ID: ${crit.id}`), { code: 'UNKNOWN_CRITERION' });
+        }
+      }
+
+      // Check for duplicate criterion IDs
+      const seenIds = new Set();
+      for (const crit of proof.criteria) {
+        if (seenIds.has(crit.id)) {
+          throw Object.assign(new Error(`Duplicate criterion ID: ${crit.id}`), { code: 'DUPLICATE_CRITERION' });
+        }
+        seenIds.add(crit.id);
+      }
+
+      // Check that all accepted criteria are covered exactly once
+      for (const id of acceptedIds) {
+        if (!seenIds.has(id)) {
+          throw Object.assign(new Error(`Missing criterion: ${id}`), { code: 'MISSING_CRITERION' });
+        }
+      }
+
+      // All validations passed — transition state and persist proof
+      const before = c.state;
+      c.transitionTo('PREFLIGHT');
+
+      await reseedFromDisk(this.#file);
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId,
+        from: before,
+        to: 'PREFLIGHT',
+        ts: c.updatedAt,
+      });
+
+      // Store proof
+      this.#proofs.set(changeId, structuredClone(proof));
+      await this.#persist();
+
+      return { state: c.state, proof: structuredClone(proof) };
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Retrieve the persisted Proof Bundle for a Change.
+   * @param {string} changeId
+   * @returns {object}
+   */
+  async getProof(changeId) {
+    const release = await acquireLock(this.#file);
+    try {
+      const proof = this.#proofs.get(changeId);
+      if (!proof) throw Object.assign(new Error(`No proof found for change ${changeId}`), { code: 'NOT_FOUND' });
+      return structuredClone(proof);
+    } finally {
+      release();
     }
   }
 }
