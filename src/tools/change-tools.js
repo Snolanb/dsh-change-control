@@ -182,5 +182,5 @@ export async function registerChangeTools(ctx, config) {
   const registry = ctx.tools;
   if (!registry?.register) throw new Error('tools.register not available');
   for (const tool of tools) registry.register(tool);
-  return tools;
+  return store;
 }
