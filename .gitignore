@@ -3,3 +3,5 @@ changes.json
 .portable-*.json
 *.log
 .DS_Store
+
+.agent-teams/
