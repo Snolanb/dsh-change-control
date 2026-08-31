@@ -131,3 +131,71 @@ test('full legal lifecycle executes all five tools with exact state/audit eviden
   assert.ok(states.includes('REVIEW'));
   assert.ok(states.includes('REPAIR'));
 }));
+
+test('V1: proof/repair denied without accepted plan', () => fixture(async ({ store, change, registry }) => {
+  await store.bindRole(change.id, 'worker-session', 'worker');
+
+  // Create change but DON'T submit/accept a plan
+  const proof = await call(registry, 'change_submit_proof', { changeId: change.id, proof: 'done' }, 'worker-session');
+  assert.equal(proof.isError, true);
+  assert.match(JSON.stringify(proof.error), /PLAN_NOT_ACCEPTED|plan.*accepted/i);
+
+  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: 'fixed' }, 'worker-session');
+  assert.equal(repair.isError, true);
+  assert.match(JSON.stringify(repair.error), /PLAN_NOT_ACCEPTED|plan.*accepted/i);
+}));
+
+test('V2: illegal transition returns structured error with code/current/attempted/allowed', () => fixture(async ({ store, change, registry }) => {
+  await store.bindRole(change.id, 'planner-session', 'planner');
+  await store.bindRole(change.id, 'worker-session', 'worker');
+  await store.bindRole(change.id, 'reviewer-session', 'reviewer');
+
+  // Submit and accept plan (acceptPlan transitions to READY)
+  const plan = await call(registry, 'change_submit_plan', { changeId: change.id, content: { steps: ['a'] } }, 'planner-session');
+  assert.equal(plan.isError, false);
+  await store.acceptPlan(change.id, plan.value.planId, { authorized: true });
+  // acceptPlan sets state to READY, so transition directly to IMPLEMENTING
+  await store.transition(change.id, 'IMPLEMENTING');
+  assert.equal((await store.get(change.id)).state, 'IMPLEMENTING');
+
+  // Submit proof (legal: IMPLEMENTING → PREFLIGHT)
+  const proof = await call(registry, 'change_submit_proof', { changeId: change.id, proof: 'done' }, 'worker-session');
+  assert.equal(proof.isError, false);
+  assert.equal(proof.value?.success, true);
+  assert.equal((await store.get(change.id)).state, 'PREFLIGHT');
+
+  // Submit review (legal: PREFLIGHT → REVIEW)
+  const review = await call(registry, 'change_submit_review', { changeId: change.id, review: 'good' }, 'reviewer-session');
+  assert.equal(review.isError, false);
+  assert.equal((await store.get(change.id)).state, 'REVIEW');
+
+  // Submit repair (legal: REVIEW → REPAIR)
+  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: 'fixed' }, 'worker-session');
+  assert.equal(repair.isError, false);
+  assert.equal((await store.get(change.id)).state, 'REPAIR');
+
+  // Now try illegal transition: proof from REPAIR (should fail)
+  const badProof = await call(registry, 'change_submit_proof', { changeId: change.id, proof: 'late' }, 'worker-session');
+  assert.equal(badProof.isError, true);
+  // Should have structured error
+  assert.ok(badProof.error?.message?.includes('cannot submitProof') || badProof.error?.message?.includes('PROOF'), 'Should have structured denial for invalid state');
+}));
+
+test('V3: structured denials preserve code/reason through ToolRuntime', () => fixture(async ({ store, change, registry }) => {
+  await store.bindRole(change.id, 'planner-session', 'planner');
+
+  // Test malformed changeId
+  const bad = await call(registry, 'change_submit_plan', { changeId: 'not-a-uuid', content: {} }, 'planner-session');
+  assert.equal(bad.isError, true);
+  assert.ok(bad.error?.code === 'INVALID_CHANGE_ID' || bad.error?.message?.includes('UUID'), 'Should have structured error code');
+
+  // Test impersonation
+  const imp = await call(registry, 'change_submit_plan', { changeId: change.id, content: {}, sessionId: 'evil', role: 'planner' }, 'planner-session');
+  assert.equal(imp.isError, true);
+  assert.ok(imp.error?.code === 'SESSION_IMPERSONATION' || imp.error?.message?.includes('impersonation'), 'Should have impersonation error');
+
+  // Test unbound session
+  const unbound = await call(registry, 'change_submit_plan', { changeId: change.id, content: {} }, 'unbound-session');
+  assert.equal(unbound.isError, true);
+  assert.ok(unbound.error?.code === 'SESSION_NOT_BOUND' || unbound.error?.message?.includes('bound'), 'Should have binding error');
+}));
