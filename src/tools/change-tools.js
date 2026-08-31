@@ -11,7 +11,6 @@ import { AuthorizationError } from '../change-control.js';
  * Map tool names to canonical service/store method names.
  */
 const HANDLER_MAP = Object.freeze({
-  change_get: 'get',
   change_submit_plan: 'submitPlan',
   change_submit_proof: 'submitProof',
   change_submit_review: 'submitReview',
@@ -84,31 +83,6 @@ export function registerChangeTools(ctx) {
           content: params.content,
         };
 
-        if (handler === 'get') {
-          // change_get: authorize via canonical ChangeService, then read from store
-          if (!service || typeof service.get !== 'function') {
-            const err = new Error('changeService.get not available');
-            err.code = 'INVALID_ARGS';
-            throw err;
-          }
-          if (!store || typeof store.get !== 'function') {
-            const err = new Error('changeStore.get not available');
-            err.code = 'INVALID_ARGS';
-            throw err;
-          }
-          // Authorization check via canonical ChangeService
-          await service.get(change);
-          // Verify session binding — fail closed when identity present but no binding store
-          if (sessionId && service.verifyBinding) {
-            const bound = await service.verifyBinding(params.changeId, sessionId);
-            if (!bound) {
-              throw new AuthorizationError('SESSION_NOT_BOUND', 'Session is not bound to this change');
-            }
-          }
-          // Read from canonical store
-          return await store.get(params.changeId);
-        }
-
         // Mutation operations: authorize via ChangeService, persist via ChangeStore
         if (!service || typeof service[handler] !== 'function') {
           throw new AuthorizationError('INVALID_ARGS', `Service method ${handler} not available`);
@@ -119,7 +93,8 @@ export function registerChangeTools(ctx) {
 
         // Authorization check via canonical ChangeService
         await service[handler](change);
-        // Verify session binding for mutations
+
+        // Verify session binding — fail closed when identity present but no binding store
         if (sessionId && service.verifyBinding) {
           const bound = await service.verifyBinding(params.changeId, sessionId);
           if (!bound) {

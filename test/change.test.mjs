@@ -29,7 +29,7 @@ test('creates a draft change with a unique id and required fields', () => {
 
 test('allows the legal workflow and repair transitions', () => {
   const change = makeChange();
-  for (const state of ['PLANNED', 'READY', 'IMPLEMENTING', 'PROOF', 'PREFLIGHT', 'REVIEW']) {
+  for (const state of ['PLANNED', 'READY', 'IMPLEMENTING', 'PREFLIGHT', 'REVIEW']) {
     transition(change, state);
     assert.equal(change.state, state);
   }

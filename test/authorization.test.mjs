@@ -102,3 +102,15 @@ test('exposes structured reasons for session and plan preconditions', () => {
   assert.equal(reason(unaccepted), 'PLAN_NOT_ACCEPTED');
   assert.equal(unaccepted.details.reason, 'PLAN_NOT_ACCEPTED');
 });
+
+// Regression test: verify binding fails closed when no store is configured
+test('verifyBinding returns false when no store is configured', async () => {
+  const service = new ChangeService({
+    role: 'planner',
+    state: 'PLANNING',
+    // No store provided
+  });
+
+  const result = await service.verifyBinding('C1', 'foreign-session');
+  assert.equal(result, false, 'verifyBinding should return false when no store is configured');
+});

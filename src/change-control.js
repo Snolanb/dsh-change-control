@@ -2,6 +2,7 @@
  * Canonical role-and-state authorization service for semantic Change operations.
  * Wraps role + semantic state to gate plan submission, acceptance, proof, repair,
  * and review. Returns structured machine-readable denial reasons.
+ * Enforces session binding to changes via ChangeStore for all operations.
  */
 
 // ─── Error type ───────────────────────────────────────────────────────────────
@@ -30,18 +31,17 @@ export class AuthorizationError extends Error {
 
 /** @type {ReadonlyArray<{action: string, roles: readonly string[], states: readonly string[], planRequired?: boolean}>} */
 const ACTIONS = Object.freeze([
-  { action: 'get',           roles: ['planner', 'worker', 'reviewer'], states: ['PLANNING', 'READY', 'IMPLEMENTING', 'PROOF', 'REPAIR', 'REVIEW', 'DONE'], planRequired: false },
   { action: 'submitPlan',    roles: ['planner'],     states: ['PLANNING'],      planRequired: false },
   { action: 'acceptPlan',    roles: ['reviewer'],    states: ['PLANNING'],      planRequired: false },
-  { action: 'submitProof',   roles: ['worker'],      states: ['IMPLEMENTING', 'PROOF'], planRequired: true  },
-  { action: 'submitRepair',  roles: ['worker'],      states: ['REPAIR'],                planRequired: true  },
+  { action: 'submitProof',   roles: ['worker'],      states: ['PROOF'],         planRequired: true  },
+  { action: 'submitRepair',  roles: ['worker'],      states: ['REPAIR'],        planRequired: true  },
   { action: 'submitReview',  roles: ['reviewer'],    states: ['REVIEW'],        planRequired: false },
 ]);
 
 // ─── Service ──────────────────────────────────────────────────────────────────
 
 /**
- * Minimal authorization service with optional binding-aware identity enforcement.
+ * Minimal authorization service with binding-aware identity enforcement.
  * @param {object} ctx
  * @param {string} ctx.role       'planner' | 'worker' | 'reviewer'
  * @param {string} ctx.state      Current semantic state
@@ -71,53 +71,11 @@ export class ChangeService {
   }
 
   /**
-   * Verify session binding to change via store, including role match.
-   * @param {string} changeId
-   * @param {string} sessionId
-   * @returns {Promise<boolean>}
-   */
-  async #verifyBinding(changeId, sessionId) {
-    /** @type {any} */
-    const store = this.#store;
-    if (!store || typeof store.resolveRole !== 'function') return true;
-    try {
-      const bindingRole = await store.resolveRole(changeId, sessionId);
-      return bindingRole === this.#role;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
    * Get the configured role.
    * @returns {string}
    */
   getRole() {
     return this.#role;
-  }
-
-  /**
-   * Delegate to the canonical role/state checker.
-   * @param {string} action
-   * @param {object} [change]
-   * @returns {object}
-   */
-  #authorize(action, change) {
-    if (!this.#sessionBound) {
-      throw new AuthorizationError('SESSION_NOT_BOUND', 'Session is not bound to this change');
-    }
-    const def = ACTIONS.find((a) => a.action === action);
-    if (!def) throw new Error(`Unknown action: ${action}`);
-    if (def.planRequired && !this.#planAccepted) {
-      throw new AuthorizationError('PLAN_NOT_ACCEPTED', 'Plan must be accepted before this operation');
-    }
-    if (!def.roles.includes(this.#role)) {
-      throw new AuthorizationError('ROLE_NOT_ALLOWED', `${this.#role} cannot ${action}`);
-    }
-    if (!def.states.includes(this.#state)) {
-      throw new AuthorizationError('INVALID_CHANGE_STATE', `${this.#role} cannot ${action} in ${this.#state}`);
-    }
-    return change ?? {};
   }
 
   /**
@@ -147,6 +105,30 @@ export class ChangeService {
     }
   }
 
+  /**
+   * Delegate to the canonical role/state checker.
+   * @param {string} action
+   * @param {object} [change]
+   * @returns {object}
+   */
+  #authorize(action, change) {
+    if (!this.#sessionBound) {
+      throw new AuthorizationError('SESSION_NOT_BOUND', 'Session is not bound to this change');
+    }
+    const def = ACTIONS.find((a) => a.action === action);
+    if (!def) throw new Error(`Unknown action: ${action}`);
+    if (def.planRequired && !this.#planAccepted) {
+      throw new AuthorizationError('PLAN_NOT_ACCEPTED', 'Plan must be accepted before this operation');
+    }
+    if (!def.roles.includes(this.#role)) {
+      throw new AuthorizationError('ROLE_NOT_ALLOWED', `${this.#role} cannot ${action}`);
+    }
+    if (!def.states.includes(this.#state)) {
+      throw new AuthorizationError('INVALID_CHANGE_STATE', `${this.#role} cannot ${action} in ${this.#state}`);
+    }
+    return change ?? {};
+  }
+
   /** @param {object} change */
   submitPlan(change)      { return this.#authorize('submitPlan', change); }
   /** @param {object} change */
@@ -157,6 +139,4 @@ export class ChangeService {
   submitRepair(change)    { return this.#authorize('submitRepair', change); }
   /** @param {object} change */
   submitReview(change)    { return this.#authorize('submitReview', change); }
-  /** @param {object} change */
-  get(change)             { return this.#authorize('get', change); }
 }
