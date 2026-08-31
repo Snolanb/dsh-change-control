@@ -1132,9 +1132,11 @@ export class ChangeStore {
 
     // 5. Required-checks filtering using host-owned requiredChecks.
     const filtered = (policy.requiredChecks ?? [])
-      .map((name) => {
+      .map((entry) => {
+        const name = typeof entry === 'string' ? entry : entry.name;
+        const defaultCheck = typeof entry === 'object' && entry.command ? { ...entry, passed: false, exitCode: 1 } : { name, passed: false, exitCode: 1 };
         const result = (checkResults ?? []).find((r) => r.name === name);
-        return result ?? { name, passed: false, exitCode: 1 };
+        return result ?? defaultCheck;
       });
 
     // 6. Any failure blocks REVIEW.

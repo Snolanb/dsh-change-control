@@ -30,3 +30,19 @@ test('protected paths cannot be changed by preflight', async (t) => { const { st
 test('invalidateProof remains effective after reopening the store', async (t) => { const { store, change, file } = await setup(t); await store.invalidateProof(change.id); const reopened = await ChangeStore.open(file); await assert.rejects(() => reopened.getProof(change.id), { code: 'NOT_FOUND' }); });
 test('object required-check definitions are normalized and honored with command metadata', async (t) => { const { store, change } = await setup(t); const objectDefs = [{ name: 'lint', command: 'npm run lint' }, { name: 'tests', command: 'npm test' }]; const runner = new PreflightRunner(store, { requiredChecks: objectDefs }); const result = await runner.run(change.id, { currentRevision: 'rev-1', changedFiles: [], checkResults: [{ name: 'lint', passed: true, exitCode: 0, command: 'npm run lint' }, { name: 'tests', passed: true, exitCode: 0, command: 'npm test' }] }); assert.equal(result.allowed, true); assert.equal(result.state, 'REVIEW'); assert.deepEqual(result.results, [{ name: 'lint', passed: true, exitCode: 0, command: 'npm run lint' }, { name: 'tests', passed: true, exitCode: 0, command: 'npm test' }]); });
 test('string shorthand required-checks remain compatible', async (t) => { const { store, change } = await setup(t); const runner = new PreflightRunner(store, { requiredChecks: ['lint', 'tests'] }); const result = await runner.run(change.id, { currentRevision: 'rev-1', changedFiles: [], checkResults: checks() }); assert.equal(result.allowed, true); assert.equal(result.state, 'REVIEW'); });
+
+test('ChangeStore.runPreflight honors object policy and reaches REVIEW', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-preflight-rp-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'changes.json');
+  const policy = { requiredChecks: [{ name: 'lint', command: 'npm run lint' }, { name: 'tests', command: 'npm test' }], protectedPaths: [] };
+  const store = await ChangeStore.open(file, { preflightPolicy: policy });
+  const change = await store.create({ title: 'Object policy test' });
+  const plan = await store.submitPlan(change.id, { objective: 'test', steps: ['test'] });
+  await store.acceptPlan(change.id, plan.id, { authorized: true });
+  await store.transition(change.id, 'IMPLEMENTING');
+  await store.submitProof(change.id, proofFor());
+  const result = await store.runPreflight(change.id, { currentRevision: 'rev-1', changedFiles: [], checkResults: [{ name: 'lint', passed: true, exitCode: 0, command: 'npm run lint' }, { name: 'tests', passed: true, exitCode: 0, command: 'npm test' }] });
+  assert.equal(result.allowed, true);
+  assert.equal(result.state, 'REVIEW');
+});
