@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { defineTool } from '/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js';
+import { defineTool } from '@deepseek-ai/dsh-tools';
 import { registerChangeTools } from '../src/tools/change-tools.js';
 import { ChangeService, AuthorizationError } from '../src/change-control.js';
 import { ChangeStore } from '../src/storage/change-store.js';

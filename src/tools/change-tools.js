@@ -4,7 +4,7 @@
  * Derives identity from exec.agent.id, rejects impersonation, validates before persistence,
  * delegates to canonical ChangeService (authorization) and ChangeStore (persistence).
  */
-import { defineTool } from '/opt/homebrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js';
+import { defineTool } from '@deepseek-ai/dsh-tools';
 
 /**
  * Map tool names to canonical service/store method names.
