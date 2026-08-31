@@ -9,8 +9,13 @@
     "build": "echo 'ESM package, no build step required'",
     "typecheck": "tsc --noEmit"
   },
+
+  "dependencies": {
+    "@deepseek-ai/dsh-tools": "^0.1.1-rc.2"
+  },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-system-prompt": "^0.1.1-rc.2",
     "typescript": "^5.7.3"
   }
 }
