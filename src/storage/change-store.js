@@ -749,6 +749,22 @@ export class ChangeStore {
   }
 
   /**
+   * Append a free-form audit event to this store's audit log.
+   * Used by external policy subsystems (e.g. filesystem policy) to record
+   * denials and other out-of-band events without mutating change state.
+   */
+  async appendAudit(event) {
+    const release = await acquireLock(this.#file);
+    try {
+      await reseedFromDisk(this.#file);
+      this.#audit.push(event);
+      await this.#persist();
+    } finally {
+      release();
+    }
+  }
+
+  /**
    * Reload bindings and attempts from disk under lock.
    * Preserves local uncommitted changes while picking up concurrent writes.
    * Bindings are synchronized by (changeId, sessionId) - replacing role on rebind.

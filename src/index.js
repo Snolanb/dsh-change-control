@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { registerChangeTools } from './tools/change-tools.js';
+import { createFilesystemPolicy } from './tools/filesystem-policy.js';
 
 const name = 'dsh-change-control';
 
@@ -19,7 +20,15 @@ async function apply(ctx, config) {
   }
 
   // Initialize ChangeStore from config and register the narrow model-facing Change tools
-  await registerChangeTools(ctx, config);
+  const store = await registerChangeTools(ctx, config);
+
+  // Wire up the filesystem/tool policy pre-execute interceptor.
+  // The policy reads the store's role bindings and change states to gate
+  // tool execution at the real DSH interception boundary.
+  const policyGate = createFilesystemPolicy(store, config);
+  if (policyGate) {
+    ctx.events.on('tools/pre-execute', policyGate);
+  }
 
   ctx.effect(() => {
     // Initialization logic runs exactly once per context
