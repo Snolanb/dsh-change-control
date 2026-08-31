@@ -1,3 +1,6 @@
+// @ts-nocheck
+import { registerChangeTools } from './tools/change-tools.js';
+
 const name = 'dsh-change-control';
 
 /**
@@ -14,6 +17,10 @@ async function apply(ctx, config) {
       '(from @deepseek-ai/dsh-tools). Ensure Cordis ToolRuntime is active before loading this plugin.'
     );
   }
+
+  // Initialize ChangeStore from config and register the narrow model-facing Change tools
+  await registerChangeTools(ctx, config);
+
   ctx.effect(() => {
     // Initialization logic runs exactly once per context
     return () => {
