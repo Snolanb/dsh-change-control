@@ -361,6 +361,13 @@ export class ChangeStore {
       }
     }
 
+    // Merge proofs: union by changeId, prefer local.
+    const diskProofs = diskData?.proofs && typeof diskData.proofs === 'object' ? diskData.proofs : {};
+    const mergedProofs = { ...diskProofs };
+    for (const [changeId, proof] of this.#proofs) {
+      mergedProofs[changeId] = proof;
+    }
+
     await writeJson(this.#file, {
       changes: [...mergedChanges.values()],
       audit: mergedAudit,
@@ -368,7 +375,7 @@ export class ChangeStore {
       plans: [...mergedPlans.values()],
       bindings: [...mergedBindings.values()],
       attempts: [...mergedAttempts.values()],
-      proofs: Object.fromEntries(this.#proofs),
+      proofs: mergedProofs,
     });
     // Clear dirty flags after successful persist.
     this.#dirtyBindings.clear();
@@ -821,6 +828,28 @@ export class ChangeStore {
     }
   }
 
+  /**
+   * Reload proofs from disk under lock.
+   * Preserves local uncommitted proofs while picking up concurrent writes.
+   */
+  async #refreshProofs() {
+    let data;
+    try {
+      data = await readJson(this.#file);
+    } catch {
+      return;
+    }
+    if (!data) return;
+    // Reload proofs from disk, sync by changeId (prefer local for uncommitted)
+    if (data.proofs && typeof data.proofs === 'object') {
+      for (const [changeId, proof] of Object.entries(data.proofs)) {
+        if (!this.#proofs.has(changeId)) {
+          this.#proofs.set(changeId, proof);
+        }
+      }
+    }
+  }
+
   // ─── Proof Bundle ───────────────────────────────────────────────────────────
 
   /**
@@ -942,6 +971,7 @@ export class ChangeStore {
   async getProof(changeId) {
     const release = await acquireLock(this.#file);
     try {
+      await this.#refreshProofs();
       const proof = this.#proofs.get(changeId);
       if (!proof) throw Object.assign(new Error(`No proof found for change ${changeId}`), { code: 'NOT_FOUND' });
       return structuredClone(proof);

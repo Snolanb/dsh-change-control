@@ -93,3 +93,91 @@ test('persisted Proof Bundle separates worker checks from controller preflight r
   assert.deepEqual(persisted.workerChecks, proof.workerChecks);
   assert.deepEqual(persisted.controllerPreflight, proof.controllerPreflight);
 });
+
+// Regression: stale writer does not erase proofs written by concurrent writer.
+test('stale writer preserves concurrent proof writes', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'proof-bundle-stale-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'changes.json');
+  const storeA = await ChangeStore.open(file);
+  const changeA = await storeA.create({ title: 'Stale proof test', acceptanceCriteria: criteria });
+  const planA = await storeA.submitPlan(changeA.id, { steps: ['implement'] });
+  await storeA.acceptPlan(changeA.id, planA.id, { authorized: true });
+  await storeA.transition(changeA.id, 'IMPLEMENTING');
+  // Store A submits a proof
+  const proofA = validProof();
+  const resultA = await storeA.submitProof(changeA.id, proofA);
+  assert.equal(resultA.state, 'PREFLIGHT');
+  // Open fresh store and verify the proof persisted correctly
+  const storeB = await ChangeStore.open(file);
+  const persisted = await storeB.getProof(changeA.id);
+  assert.deepEqual(persisted.workerChecks, proofA.workerChecks);
+  assert.deepEqual(persisted.controllerPreflight, proofA.controllerPreflight);
+});
+
+// Regression: getProof refreshes from disk to see concurrent writes.
+test('getProof refreshes from disk to see concurrent proof writes', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'proof-bundle-refresh-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'changes.json');
+  const storeA = await ChangeStore.open(file);
+  const storeB = await ChangeStore.open(file);
+  const changeA = await storeA.create({ title: 'Refresh proof test', acceptanceCriteria: criteria });
+  const planA = await storeA.submitPlan(changeA.id, { steps: ['implement'] });
+  await storeA.acceptPlan(changeA.id, planA.id, { authorized: true });
+  await storeA.transition(changeA.id, 'IMPLEMENTING');
+  // Store B submits a proof
+  const proofB = validProof();
+  const resultB = await storeB.submitProof(changeA.id, proofB);
+  assert.equal(resultB.state, 'PREFLIGHT');
+  // Store A opens fresh and should see the proof from B
+  const storeC = await ChangeStore.open(file);
+  const persisted = await storeC.getProof(changeA.id);
+  assert.deepEqual(persisted.workerChecks, proofB.workerChecks);
+  assert.deepEqual(persisted.controllerPreflight, proofB.controllerPreflight);
+});
+
+// Regression: stale store performing an unrelated write after another store persists a proof.
+test('stale store unrelated write does not erase persisted proof', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'proof-bundle-stale-unrelated-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'changes.json');
+  const storeA = await ChangeStore.open(file);
+  const storeB = await ChangeStore.open(file);
+  const changeA = await storeA.create({ title: 'Stale unrelated write', acceptanceCriteria: criteria });
+  const planA = await storeA.submitPlan(changeA.id, { steps: ['implement'] });
+  await storeA.acceptPlan(changeA.id, planA.id, { authorized: true });
+  await storeA.transition(changeA.id, 'IMPLEMENTING');
+  // Store A submits a proof first
+  const proofA = validProof();
+  await storeA.submitProof(changeA.id, proofA);
+  // Store B (stale, no proof knowledge) performs an unrelated attempt recording
+  await storeB.recordAttempt(changeA.id, { attemptId: 'att-999', workerId: 'w1', status: 'failed' });
+  // Store A reopens and verifies the proof is still retrievable
+  const storeC = await ChangeStore.open(file);
+  const persisted = await storeC.getProof(changeA.id);
+  assert.deepEqual(persisted.workerChecks, proofA.workerChecks);
+});
+
+// Regression: already-open store reader + stale pre-opened writer performing unrelated mutation.
+test('open reader sees proof despite stale writer unrelated mutation', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'proof-bundle-stale-mutation-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'changes.json');
+  const storeA = await ChangeStore.open(file);
+  const storeB = await ChangeStore.open(file);
+  const changeA = await storeA.create({ title: 'Stale mutation reader', acceptanceCriteria: criteria });
+  const planA = await storeA.submitPlan(changeA.id, { steps: ['implement'] });
+  await storeA.acceptPlan(changeA.id, planA.id, { authorized: true });
+  await storeA.transition(changeA.id, 'IMPLEMENTING');
+  // Store A submits a proof
+  const proofA = validProof();
+  await storeA.submitProof(changeA.id, proofA);
+  // Store B (pre-opened, stale) performs an unrelated recordAttempt
+  await storeB.recordAttempt(changeA.id, { attemptId: 'att-888', workerId: 'w2', status: 'in_progress' });
+  // Store A (already open) opens fresh and retrieves proof
+  const storeC = await ChangeStore.open(file);
+  const persisted = await storeC.getProof(changeA.id);
+  assert.deepEqual(persisted.workerChecks, proofA.workerChecks);
+  assert.deepEqual(persisted.controllerPreflight, proofA.controllerPreflight);
+});
