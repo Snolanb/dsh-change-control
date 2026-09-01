@@ -116,7 +116,8 @@ test('full legal lifecycle executes all five tools with exact state/audit eviden
   assert.equal((await store.get(change.id)).state, 'REPAIR');
 
   // 4. Repair: REPAIR → PREFLIGHT
-  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: 'fixed it' }, 'worker-session');
+  const reviewFindings = (await store.getReview(change.id)).findings;
+  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: { findings: [{ findingId: reviewFindings[0].id, status: 'fixed', claim: 'fixed' }], proof: { bundleId: 'proof-2', beforeRevision: 'impl-1', afterRevision: 'impl-2' } } }, 'worker-session');
   assert.equal(repair.isError, false);
   assert.equal(repair.value?.success, true);
   assert.equal((await store.get(change.id)).state, 'PREFLIGHT');
@@ -157,7 +158,7 @@ test('V1: proof/repair denied without accepted plan', () => fixture(async ({ sto
   assert.equal(proof.isError, true);
   assert.match(JSON.stringify(proof.error), /PLAN_NOT_ACCEPTED|plan.*accepted/i);
 
-  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: 'fixed' }, 'worker-session');
+  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: { findings: [], proof: { bundleId: 'proof-2' } } }, 'worker-session');
   assert.equal(repair.isError, true);
   assert.match(JSON.stringify(repair.error), /PLAN_NOT_ACCEPTED|plan.*accepted/i);
 }));
@@ -198,7 +199,8 @@ test('V2: illegal transition returns structured error with code/current/attempte
   assert.equal((await store.get(change.id)).state, 'REPAIR');
 
   // Submit repair (legal: REPAIR → PREFLIGHT)
-  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: 'fixed' }, 'worker-session');
+  const reviewFindings = review.value?.findings || [];
+  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: { findings: reviewFindings.map((f) => ({ findingId: f.id, status: 'fixed', claim: 'fixed' })), proof: { bundleId: 'proof-2', beforeRevision: 'impl-1', afterRevision: 'impl-2' } } }, 'worker-session');
   assert.equal(repair.isError, false);
   assert.equal((await store.get(change.id)).state, 'PREFLIGHT');
 
@@ -228,6 +230,63 @@ test('V3: structured denials preserve code/reason through ToolRuntime', () => fi
   assert.ok(unbound.error?.code === 'SESSION_NOT_BOUND' || unbound.error?.message?.includes('bound'), 'Should have binding error');
 }));
 
+test('repair rejects unknown finding IDs without state, audit, or persistence side effects', () => fixture(async ({ file, store, change, registry }) => {
+  await store.bindRole(change.id, 'worker-session', 'worker');
+  await store.bindRole(change.id, 'reviewer-session', 'reviewer');
+  const plan = await store.submitPlan(change.id, { steps: ['implement'] });
+  await store.acceptPlan(change.id, plan.id, { authorized: true });
+  await store.transition(change.id, 'IMPLEMENTING');
+  await store.recordAttempt(change.id, { attemptId: 'impl-1', workerId: 'worker-session', revision: 'impl-1', status: 'completed' });
+  await store.transition(change.id, 'PREFLIGHT');
+  await store.transition(change.id, 'REVIEW');
+  const review = await store.submitReview(change.id, { verdict: 'fail', revision: 'impl-1', findings: [{ severity: 'critical', category: 'security', location: 'file.js:1', problem: 'Issue', requiredOutcome: 'Fix' }] }, { sessionId: 'reviewer-session' });
+  const beforeHistory = await store.history(change.id);
+  const beforeFile = await readFile(file, 'utf8');
+  const denied = await call(registry, 'change_submit_repair', { changeId: change.id, repair: { findings: [{ findingId: 'finding-unknown', status: 'fixed', claim: 'nope' }], proof: { bundleId: 'proof-2', beforeRevision: 'impl-1', afterRevision: 'impl-2' } } }, 'worker-session');
+  assert.equal(denied.isError, true);
+  assert.match(JSON.stringify(denied.error), /unknown|finding/i);
+  assert.deepEqual(await store.history(change.id), beforeHistory);
+  assert.equal(await readFile(file, 'utf8'), beforeFile);
+  assert.equal((await store.get(change.id)).state, 'REPAIR');
+  assert.ok(review.findings[0].id);
+}));
+
+test('REPAIR worker query returns unresolved findings through change_get', () => fixture(async ({ store, change, registry }) => {
+  await store.bindRole(change.id, 'worker-session', 'worker');
+  await store.bindRole(change.id, 'reviewer-session', 'reviewer');
+  await store.transition(change.id, 'PLANNED');
+  await store.transition(change.id, 'READY');
+  await store.transition(change.id, 'IMPLEMENTING');
+  await store.recordAttempt(change.id, { attemptId: 'impl-1', workerId: 'worker-session', revision: 'impl-1', status: 'completed' });
+  await store.transition(change.id, 'PREFLIGHT');
+  await store.transition(change.id, 'REVIEW');
+  await store.submitReview(change.id, { verdict: 'fail', revision: 'impl-1', findings: [{ severity: 'critical', category: 'security', location: 'file.js:1', problem: 'Issue', requiredOutcome: 'Fix' }] }, { sessionId: 'reviewer-session' });
+  const queried = await call(registry, 'change_get', { changeId: change.id }, 'worker-session');
+  assert.equal(queried.isError, false);
+  assert.equal(queried.value.state, 'REPAIR');
+  assert.equal(queried.value.unresolvedFindings.length, 1);
+}));
+
+test('implementation repair requires a new proof bundle before PREFLIGHT', () => fixture(async ({ store, change, registry }) => {
+  await store.bindRole(change.id, 'worker-session', 'worker');
+  await store.bindRole(change.id, 'reviewer-session', 'reviewer');
+  const plan = await store.submitPlan(change.id, { steps: ['implement'] });
+  await store.acceptPlan(change.id, plan.id, { authorized: true });
+  await store.transition(change.id, 'IMPLEMENTING');
+  await store.recordAttempt(change.id, { attemptId: 'impl-1', workerId: 'worker-session', revision: 'impl-1', status: 'completed' });
+  await store.transition(change.id, 'PREFLIGHT');
+  await store.transition(change.id, 'REVIEW');
+  const review = await store.submitReview(change.id, { verdict: 'fail', revision: 'impl-1', findings: [{ severity: 'critical', category: 'security', location: 'file.js:1', problem: 'Issue', requiredOutcome: 'Fix' }] }, { sessionId: 'reviewer-session' });
+  const repair = { findings: [{ findingId: review.findings[0].id, status: 'fixed', claim: 'fixed' }] };
+  const denied = await call(registry, 'change_submit_repair', { changeId: change.id, repair }, 'worker-session');
+  assert.equal(denied.isError, true);
+  assert.equal((await store.get(change.id)).state, 'REPAIR');
+  repair.proof = { bundleId: 'proof-2', beforeRevision: 'impl-1', afterRevision: 'impl-2' };
+  const accepted = await call(registry, 'change_submit_repair', { changeId: change.id, repair }, 'worker-session');
+  assert.equal(accepted.isError, false);
+  assert.equal((await store.get(change.id)).state, 'PREFLIGHT');
+}));
+
 test('V4: repair from REVIEW without recorded review is rejected (N5 regression)', () => fixture(async ({ store, change, registry }) => {
   await store.bindRole(change.id, 'planner-session', 'planner');
   await store.bindRole(change.id, 'worker-session', 'worker');
@@ -249,7 +308,7 @@ test('V4: repair from REVIEW without recorded review is rejected (N5 regression)
   assert.equal((await store.get(change.id)).state, 'REVIEW');
 
   // Try to submit repair directly from REVIEW (should fail - no review recorded)
-  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: 'bypass' }, 'worker-session');
+  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: { findings: [], proof: { bundleId: 'proof-2' } } }, 'worker-session');
   assert.equal(repair.isError, true);
   assert.ok(repair.error?.code === 'INVALID_STATE' || repair.error?.message?.includes('expected REPAIR'), 'Should reject repair from REVIEW without prior review');
   // State should remain REVIEW

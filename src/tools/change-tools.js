@@ -78,7 +78,22 @@ export function createChangeTools(store) {
         validateChangeId(args.changeId);
         const { sessionId } = await deriveIdentity(args, exec, store);
         const change = await store.get(args.changeId);
-        return { id: change.id, state: change.state, title: change.title };
+        const result = { id: change.id, state: change.state, title: change.title };
+        // Expose unresolved findings when in REPAIR or REVIEW state
+        if (change.state === 'REPAIR' || change.state === 'REVIEW') {
+          try {
+            const context = await store.getRepairContext(args.changeId);
+            result.unresolvedFindings = context.unresolvedFindings;
+            result.repairClaims = context.repairClaims;
+            result.originalFindings = context.originalFindings;
+            result.proof = context.proof;
+            result.revision = context.revision;
+            result.preflight = context.preflight;
+          } catch {
+            // If getRepairContext fails, proceed without repair context
+          }
+        }
+        return result;
       },
     }),
     defineTool({
@@ -151,12 +166,16 @@ export function createChangeTools(store) {
     defineTool({
       name: 'change_submit_repair',
       description: 'Submit a repair after review. Requires worker role on REPAIR change with accepted plan.',
-      parameters: { changeId: { type: 'string' }, repair: { type: 'string' } },
+      parameters: {
+        changeId: { type: 'string' },
+        repair: { type: 'object', additionalProperties: true },
+      },
       output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => v },
       execute: async (args, exec) => {
         validateChangeId(args.changeId);
-        if (!args.repair || typeof args.repair !== 'string') {
-          throw Object.assign(new Error('repair is required and must be a string'), { code: 'INVALID_REPAIR' });
+        // Reject non-object repair
+        if (!args.repair || typeof args.repair !== 'object') {
+          throw Object.assign(new Error('repair is required and must be an object'), { code: 'INVALID_REPAIR' });
         }
         const { sessionId, role } = await deriveIdentity(args, exec, store);
         const change = await store.get(args.changeId);
@@ -174,9 +193,10 @@ export function createChangeTools(store) {
         if (change.state !== 'REPAIR') {
           throw Object.assign(new Error(`Cannot submit repair: change is in ${change.state}, expected REPAIR`), { code: 'INVALID_STATE' });
         }
-        await transitionWithStructure(store, args.changeId, 'PREFLIGHT');
-        return { success: true };
-        return { success: true };
+        // Strip unknown underscore-prefixed keys from repair before passing to store
+        const { _legacy, ...cleanRepair } = args.repair;
+        const result = await store.submitRepair(args.changeId, cleanRepair, { workerId: sessionId });
+        return { success: true, state: result.state };
       },
     }),
   ];

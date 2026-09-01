@@ -153,12 +153,18 @@ export class ChangeStore {
   #proofs = new Map();
   /** @type {Map<string, Array>} changeId -> controller preflight results */
   #preflightResults = new Map();
+  /** @type {Map<string, Array<{findingId: string, status: string, claim: string, recordedAt: string}>>} changeId -> repair claims (append-only) */
+  #repairClaims = new Map();
+  /** @type {Map<string, object>} changeId -> repair proof (last submitted) */
+  #repairProofs = new Map();
   /** @type {Map<string, Array<{id: string, sessionId: string, verdict: string, revision: string, findings: Array<object>, submittedAt: string, stale: boolean}>>} changeId -> review records (append-only) */
   #reviews = new Map();
   /** @type {Set<string>} Keys of locally mutated reviews (changeId) */
   #dirtyReviews = new Set();
   /** @type {Set<string>} Keys of locally mutated bindings (changeId:sessionId) */
   #dirtyBindings = new Set();
+  /** @type {Set<string>} Keys of locally mutated repair claims (changeId) */
+  #dirtyRepairClaims = new Set();
   /** @type {{requiredChecks: Array<string|object>, protectedPaths: string[]} | null} */
   #preflightPolicy = null;
 
@@ -242,6 +248,20 @@ export class ChangeStore {
         }
       }
     }
+    // Repair claims: keyed by changeId, stored as append-only array.
+    if (data.repairClaims && typeof data.repairClaims === 'object') {
+      for (const [changeId, claims] of Object.entries(data.repairClaims)) {
+        if (Array.isArray(claims)) {
+          this.#repairClaims.set(changeId, claims);
+        }
+      }
+    }
+    // Repair proofs: keyed by changeId.
+    if (data.repairProofs && typeof data.repairProofs === 'object') {
+      for (const [changeId, proof] of Object.entries(data.repairProofs)) {
+        this.#repairProofs.set(changeId, proof);
+      }
+    }
   }
 
   /**
@@ -301,6 +321,14 @@ export class ChangeStore {
       for (const [changeId, reviews] of Object.entries(data.reviews)) {
         if (Array.isArray(reviews)) {
           this.#reviews.set(changeId, reviews);
+        }
+      }
+    }
+    // Reload repair claims from disk to preserve records from other instances.
+    if (data.repairClaims && typeof data.repairClaims === 'object') {
+      for (const [changeId, claims] of Object.entries(data.repairClaims)) {
+        if (Array.isArray(claims)) {
+          this.#repairClaims.set(changeId, claims);
         }
       }
     }
@@ -430,6 +458,22 @@ export class ChangeStore {
       }
     }
 
+    // Merge repair claims: append-only per changeId, dirty guard mirrors #dirtyReviews
+    const diskRepairClaims = diskData?.repairClaims && typeof diskData.repairClaims === 'object' ? diskData.repairClaims : {};
+    const mergedRepairClaims = { ...diskRepairClaims };
+    for (const [changeId, claims] of this.#repairClaims) {
+      if (this.#dirtyRepairClaims.has(changeId)) {
+        mergedRepairClaims[changeId] = claims;
+      }
+    }
+
+    // Merge repair proofs: union by changeId, prefer local.
+    const diskRepairProofs = diskData?.repairProofs && typeof diskData.repairProofs === 'object' ? diskData.repairProofs : {};
+    const mergedRepairProofs = { ...diskRepairProofs };
+    for (const [changeId, proof] of this.#repairProofs) {
+      mergedRepairProofs[changeId] = proof;
+    }
+
     await writeJson(this.#file, {
       changes: [...mergedChanges.values().filter((c) => c)],
       preflightResults: mergedPreflightResults,
@@ -440,10 +484,13 @@ export class ChangeStore {
       attempts: [...mergedAttempts.values()],
       proofs: mergedProofs,
       reviews: mergedReviews,
+      repairClaims: mergedRepairClaims,
+      repairProofs: mergedRepairProofs,
     });
     // Clear dirty flags after successful persist.
     this.#dirtyBindings.clear();
     this.#dirtyReviews.clear();
+    this.#dirtyRepairClaims.clear();
   }
 
   async create(input) {
@@ -1463,6 +1510,204 @@ export class ChangeStore {
       if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
       const reviews = this.#reviews.get(changeId) ?? [];
       return structuredClone(reviews);
+    } finally {
+      release();
+    }
+  }
+
+  // ─── Repair Cycle Support ───────────────────────────────────────────────────
+
+  /**
+   * Get repair context for a change in REPAIR state.
+   * Returns unresolved findings, repair claims, and related state.
+   */
+  async getRepairContext(changeId) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+
+      // Get all reviews to find original findings
+      const reviews = this.#reviews.get(changeId) ?? [];
+      const allFindings = reviews.flatMap((r) => r.findings ?? []);
+
+      // Get repair claims
+      const claims = this.#repairClaims.get(changeId) ?? [];
+
+      // Unresolved findings: filter to blocking severities
+      // (fixing records a claim but does not close the reviewer finding)
+      const unresolvedFindings = allFindings.filter((f) => f.severity === 'important' || f.severity === 'critical');
+
+      // Get current revision from attempts
+      const attempts = this.#attempts.get(changeId) ?? [];
+      const revision = attempts.length > 0 ? (attempts[attempts.length - 1].revision || null) : null;
+
+      // Get repair proof if available (prefer canonical #proofs, fallback to #repairProofs)
+      const repairProof = this.#proofs.get(changeId) ?? this.#repairProofs.get(changeId) ?? null;
+
+      // Get preflight state
+      const preflightResults = this.#preflightResults.get(changeId);
+      const preflight = preflightResults
+        ? { state: c.state, controllerResults: preflightResults }
+        : { state: c.state };
+
+      return {
+        state: c.state,
+        unresolvedFindings: structuredClone(unresolvedFindings),
+        repairClaims: structuredClone(claims),
+        originalFindings: structuredClone(allFindings),
+        revision,
+        proof: repairProof ? structuredClone(repairProof) : null,
+        preflight,
+      };
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Submit a repair after review. Validates finding IDs, records claims, requires proof.
+   * @param {string} changeId
+   * @param {object} repair
+   * @param {Array<{findingId: string, status: string, claim: string}>} repair.findings
+   * @param {object} repair.proof
+   * @param {{workerId: string}} [opts]
+   * @returns {{state: string}}
+   */
+  async submitRepair(changeId, repair, opts = {}) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+
+      if (c.state !== 'REPAIR') {
+        throw Object.assign(new Error(`Cannot submit repair: change is in ${c.state}, expected REPAIR`), { code: 'INVALID_STATE' });
+      }
+
+      // Validate repair structure
+      if (!repair || typeof repair !== 'object') {
+        throw Object.assign(new Error('Repair is required'), { code: 'INVALID_REPAIR' });
+      }
+      // findings and proof are required for repair-cycle ACs
+      if (!Array.isArray(repair.findings)) {
+        throw Object.assign(new Error('findings is required and must be an array'), { code: 'INVALID_REPAIR' });
+      }
+      if (!repair.proof || typeof repair.proof !== 'object') {
+        throw Object.assign(new Error('proof is required'), { code: 'INVALID_REPAIR' });
+      }
+
+      // Validate proof structure - require beforeRevision and afterRevision (mandatory)
+      if (!repair.proof.beforeRevision || typeof repair.proof.beforeRevision !== 'string') {
+        throw Object.assign(new Error('proof.beforeRevision is required'), { code: 'INVALID_PROOF' });
+      }
+      if (!repair.proof.afterRevision || typeof repair.proof.afterRevision !== 'string') {
+        throw Object.assign(new Error('proof.afterRevision is required'), { code: 'INVALID_PROOF' });
+      }
+
+      // Get all reviews to validate finding IDs
+      const reviews = this.#reviews.get(changeId) ?? [];
+      const allReviewFindings = reviews.flatMap((r) => r.findings ?? []);
+      const knownFindingIds = new Set(allReviewFindings.map((f) => f.id));
+
+      // Filter to unresolved blocking findings
+      const blockingFindings = allReviewFindings.filter((f) => f.severity === 'important' || f.severity === 'critical');
+      const existingClaims = this.#repairClaims.get(changeId) ?? [];
+      const claimedBlockingIds = new Set(existingClaims.filter((cl) => cl.status === 'fixed').map((cl) => cl.findingId));
+      const unresolvedBlocking = blockingFindings.filter((f) => !claimedBlockingIds.has(f.id));
+
+      // Require every unresolved blocking finding to have a claim
+      if (unresolvedBlocking.length > 0 && repair.findings.length === 0) {
+        throw Object.assign(new Error('Cannot submit empty findings while blocking findings are unresolved'), { code: 'INVALID_REPAIR' });
+      }
+
+      const unresolvedBlockingIds = new Set(unresolvedBlocking.map((f) => f.id));
+      const submittedFindingIds = new Set(repair.findings.map((f) => f.findingId));
+      const missingClaims = [...unresolvedBlockingIds].filter((id) => !submittedFindingIds.has(id));
+      if (missingClaims.length > 0) {
+        throw Object.assign(new Error(`Missing claims for blocking findings: ${missingClaims.join(', ')}`), { code: 'INVALID_REPAIR' });
+      }
+
+      // Validate each finding reference
+      for (const findingRef of repair.findings) {
+        if (!findingRef.findingId || typeof findingRef.findingId !== 'string') {
+          throw Object.assign(new Error('Each finding ref must have a string findingId'), { code: 'INVALID_REPAIR' });
+        }
+        if (!knownFindingIds.has(findingRef.findingId)) {
+          throw Object.assign(new Error(`Unknown finding ID: ${findingRef.findingId}`), { code: 'UNKNOWN_FINDING' });
+        }
+        if (!findingRef.status || typeof findingRef.status !== 'string') {
+          throw Object.assign(new Error('Each finding ref must have a status'), { code: 'INVALID_REPAIR' });
+        }
+        if (!['fixed', 'acknowledged'].includes(findingRef.status)) {
+          throw Object.assign(new Error(`Invalid finding status: ${findingRef.status}. Use 'fixed' or 'acknowledged'.`), { code: 'INVALID_REPAIR' });
+        }
+        // For blocking findings (important/critical), only 'fixed' is allowed
+        const finding = allReviewFindings.find((f) => f.id === findingRef.findingId);
+        if (finding && (finding.severity === 'important' || finding.severity === 'critical') && findingRef.status === 'acknowledged') {
+          throw Object.assign(new Error(`Blocking findings (${finding.severity}) must be 'fixed', not 'acknowledged'`), { code: 'INVALID_REPAIR' });
+        }
+      }
+
+      // Enforce proof newness: refresh durable proofs before duplicate check
+      await this.#refreshProofs();
+      const existingProof = this.#proofs.get(changeId);
+      if (existingProof) {
+        const existingJson = JSON.stringify(existingProof);
+        const newJson = JSON.stringify(repair.proof);
+        if (existingJson === newJson) {
+          throw Object.assign(new Error('Proof must be new - cannot submit identical proof'), { code: 'STALE_PROOF' });
+        }
+      }
+
+      // Require proof.beforeRevision to match reviewed revision and afterRevision to differ
+      const attempts = this.#attempts.get(changeId) ?? [];
+      const currentRevision = attempts.length > 0 ? (attempts[attempts.length - 1].revision || null) : null;
+      if (currentRevision && repair.proof.beforeRevision !== currentRevision) {
+        throw Object.assign(new Error(`proof.beforeRevision (${repair.proof.beforeRevision}) must match current revision (${currentRevision})`), { code: 'INVALID_PROOF' });
+      }
+      if (repair.proof.afterRevision === repair.proof.beforeRevision) {
+        throw Object.assign(new Error('proof.afterRevision must differ from proof.beforeRevision'), { code: 'INVALID_PROOF' });
+      }
+
+      // ALL VALIDATION COMPLETE - now perform mutations atomically
+
+      // Record repair claims
+      const now = new Date().toISOString();
+      const claims = repair.findings.map((f) => ({
+        findingId: f.findingId,
+        status: f.status,
+        claim: f.claim || '',
+        recordedAt: now,
+      }));
+
+      const changeClaims = this.#repairClaims.get(changeId) ?? [];
+      const newClaims = [...changeClaims, ...claims];
+      this.#repairClaims.set(changeId, newClaims);
+      this.#dirtyRepairClaims.add(changeId);
+
+      // Route proof through canonical proof store so getProof/runPreflight see it
+      this.#proofs.set(changeId, structuredClone(repair.proof));
+      // Also store in repair proofs for backward compatibility
+      this.#repairProofs.set(changeId, structuredClone(repair.proof));
+
+      // Transition to PREFLIGHT
+      const before = c.state;
+      c.transitionTo('PREFLIGHT');
+
+      await reseedFromDisk(this.#file);
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId,
+        from: before,
+        to: 'PREFLIGHT',
+        ts: c.updatedAt,
+      });
+
+      await this.#persist();
+
+      return { state: c.state };
     } finally {
       release();
     }
