@@ -11,6 +11,22 @@ import { readFile, writeFile, rename, unlink } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { createChange, ChangeDomainError, TRANSITIONS, RISK_LEVELS } from '../domain/change.js';
 
+// Budget event kind -> durable counter field.
+const BUDGET_KINDS = {
+  implementation: 'implementationAttempts',
+  repair: 'repairAttempts',
+  reviewRound: 'reviewRounds',
+  reviewFailure: 'reviewFailures',
+  preflightFailure: 'preflightFailures',
+};
+// Counter field -> host budget policy threshold key.
+const BUDGET_LIMIT_FOR_COUNTER = {
+  repairAttempts: 'maxRepairAttempts',
+  reviewFailures: 'maxReviewFailures',
+};
+/** The only host policy keys accepted: each maps to an enforced threshold. */
+const BUDGET_POLICY_KEYS = new Set(Object.values(BUDGET_LIMIT_FOR_COUNTER));
+
 const writeLocks = new Map();
 /** Monotonic counter for collision-free event IDs. Seeded from disk on load. */
 let eventIdSeq = 0;
@@ -171,11 +187,28 @@ export class ChangeStore {
   #dirtyRepairClaims = new Set();
   /** @type {{requiredChecks: Array<string|object>, protectedPaths: string[]} | null} */
   #preflightPolicy = null;
+  /** Host-owned budget thresholds ({maxRepairAttempts?, maxReviewFailures?}) or null. */
+  #budgetPolicy = null;
+  /** @type {Map<string, object>} changeId -> budget record (counters, escalation, override) */
+  #budgets = new Map();
 
-  constructor(file, { preflightPolicy } = {}) {
+  constructor(file, { preflightPolicy, budgetPolicy } = {}) {
     this.#file = canonicalPath(file);
     this.#changes = new Map();
     this.#audit = [];
+    if (budgetPolicy && typeof budgetPolicy === 'object') {
+      // Fail closed: only the two enforced thresholds are accepted, so the
+      // exposed policy never advertises limits that cannot trigger escalation.
+      for (const [key, value] of Object.entries(budgetPolicy)) {
+        if (!BUDGET_POLICY_KEYS.has(key)) {
+          throw Object.assign(new Error(`Unsupported budget policy key: ${key}`), { code: 'INVALID_BUDGET_POLICY' });
+        }
+        if (typeof value !== 'number' || value < 0) {
+          throw Object.assign(new Error(`Budget policy ${key} must be a non-negative number`), { code: 'INVALID_BUDGET_POLICY' });
+        }
+      }
+      this.#budgetPolicy = { ...budgetPolicy };
+    }
     if (preflightPolicy) {
       this.#preflightPolicy = {
         requiredChecks: Array.isArray(preflightPolicy.requiredChecks) ? preflightPolicy.requiredChecks : [],
@@ -270,6 +303,12 @@ export class ChangeStore {
     if (data.repairProofs && typeof data.repairProofs === 'object') {
       for (const [changeId, proof] of Object.entries(data.repairProofs)) {
         this.#repairProofs.set(changeId, proof);
+      }
+    }
+    // Budgets: keyed by changeId.
+    if (data.budgets && typeof data.budgets === 'object') {
+      for (const [changeId, budget] of Object.entries(data.budgets)) {
+        if (budget && typeof budget === 'object') this.#budgets.set(changeId, budget);
       }
     }
   }
@@ -501,6 +540,15 @@ export class ChangeStore {
       mergedRepairProofs[changeId] = proof;
     }
 
+    // Merge budgets: union by changeId, prefer local. Local entries are
+    // already disk-merged additively by #refreshBudgets under the write lock,
+    // so preferring local here never drops an increment.
+    const diskBudgets = diskData?.budgets && typeof diskData.budgets === 'object' ? diskData.budgets : {};
+    const mergedBudgets = { ...diskBudgets };
+    for (const [changeId, budget] of this.#budgets) {
+      mergedBudgets[changeId] = budget;
+    }
+
     await writeJson(this.#file, {
       changes: [...mergedChanges.values().filter((c) => c)],
       preflightResults: mergedPreflightResults,
@@ -514,6 +562,7 @@ export class ChangeStore {
       reviews: mergedReviews,
       repairClaims: mergedRepairClaims,
       repairProofs: mergedRepairProofs,
+      budgets: mergedBudgets,
     });
     // Clear dirty flags after successful persist.
     this.#dirtyBindings.clear();
@@ -1896,6 +1945,250 @@ export class ChangeStore {
       await this.#persist();
 
       return { state: c.state };
+    } finally {
+      release();
+    }
+  }
+
+  // ─── Execution/review budgets and escalation ────────────────────────────────
+  // Host-owned durable counters and thresholds. No model-facing tool registers
+  // these methods; the only mutations below require an explicit human actor.
+
+  /**
+   * Reload budgets from disk under lock, preserving local uncommitted entries.
+   */
+  async #refreshBudgets() {
+    let data;
+    try {
+      data = await readJson(this.#file);
+    } catch {
+      return;
+    }
+    if (!data) return;
+    if (data.budgets && typeof data.budgets === 'object') {
+      for (const [changeId, diskBudget] of Object.entries(data.budgets)) {
+        if (!diskBudget || typeof diskBudget !== 'object') continue;
+        const local = this.#budgets.get(changeId);
+        if (!local) {
+          this.#budgets.set(changeId, diskBudget);
+          continue;
+        }
+        // Additive merge: every retained increment wins (monotonic max per
+        // counter) so concurrent instances never lose a recorded event.
+        // recordBudgetEvent runs this refresh under the per-file write lock,
+        // so disk is always current at increment time.
+        for (const key of Object.values(BUDGET_KINDS)) {
+          local.counters[key] = Math.max(local.counters[key] ?? 0, diskBudget.counters?.[key] ?? 0);
+        }
+        if (!local.escalation && diskBudget.escalation) local.escalation = diskBudget.escalation;
+        if (!local.override && diskBudget.override) local.override = diskBudget.override;
+        local.overriddenLimits = [...new Set([...(local.overriddenLimits ?? []), ...(diskBudget.overriddenLimits ?? [])])];
+      }
+    }
+  }
+
+  #getOrInitBudget(changeId) {
+    let b = this.#budgets.get(changeId);
+    if (!b) {
+      b = {
+        counters: {
+          implementationAttempts: 0,
+          repairAttempts: 0,
+          reviewRounds: 0,
+          reviewFailures: 0,
+          preflightFailures: 0,
+        },
+        escalation: null,
+        override: null,
+        overriddenLimits: [],
+      };
+      this.#budgets.set(changeId, b);
+    }
+    b.overriddenLimits ??= [];
+    if (!b.counters) {
+      // Rehydrating an older persisted shape.
+      b.counters = {
+        implementationAttempts: 0,
+        repairAttempts: 0,
+        reviewRounds: 0,
+        reviewFailures: 0,
+        preflightFailures: 0,
+      };
+      b.escalation ??= null;
+      b.override ??= null;
+    }
+    return b;
+  }
+
+  /**
+   * Frozen projection: counters + escalated flag, plus host-visible
+   * limits/escalation/override only when configured/present. The escalation
+   * record is provider- and model-neutral by construction.
+   */
+  #projectBudget(b) {
+    const proj = { ...b.counters, escalated: Boolean(b.escalation) };
+    if (this.#budgetPolicy && Object.keys(this.#budgetPolicy).length > 0) {
+      proj.limits = structuredClone(this.#budgetPolicy);
+    }
+    if (b.escalation) proj.escalation = structuredClone(b.escalation);
+    if (b.override) proj.override = structuredClone(b.override);
+    return Object.freeze(proj);
+  }
+
+  /**
+   * Read the durable budget projection for a change.
+   * @param {string} changeId
+   */
+  async getBudget(changeId) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      await this.#refreshBudgets();
+      return this.#projectBudget(this.#getOrInitBudget(changeId));
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Record one budget-event counter increment. Host ingestion point for
+   * implementation/repair/review-round/review-failure/preflight-failure
+   * accounting; `provider`/`model` fields from callers are never persisted.
+   * On threshold breach the change escalates explicitly and further counter
+   * events stop mutating, so nothing continues silently.
+   * @returns {{escalated: boolean, continue: boolean}}
+   */
+  async recordBudgetEvent(changeId, kind, meta = {}) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      const counterKey = BUDGET_KINDS[kind];
+      if (!counterKey) {
+        throw Object.assign(new Error(`Unknown budget event kind: ${kind}`), { code: 'INVALID_BUDGET_KIND' });
+      }
+      await this.#refreshBudgets();
+      const b = this.#getOrInitBudget(changeId);
+      if (b.escalation) {
+        // Already escalated: explicit stop, no silent continuation.
+        return { escalated: true, continue: false };
+      }
+      b.counters[counterKey] += 1;
+      const limitKey = BUDGET_LIMIT_FOR_COUNTER[counterKey];
+      // Limits waived by a human override stay open until resetBudget.
+      const waived = limitKey && b.overriddenLimits.includes(limitKey);
+      const limit = limitKey && !waived ? this.#budgetPolicy?.[limitKey] : undefined;
+      if (typeof limit === 'number' && b.counters[counterKey] > limit) {
+        b.escalation = { reason: limitKey, at: new Date().toISOString() };
+        await reseedFromDisk(this.#file);
+        this.#audit.push({
+          eventId: nextEventId(),
+          changeId,
+          type: 'BUDGET_ESCALATED',
+          reason: limitKey,
+          ts: b.escalation.at,
+        });
+        await this.#persist();
+        return { escalated: true, continue: false };
+      }
+      await this.#persist();
+      return { escalated: false, continue: true };
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Whether execution/review work may continue for this change.
+   * Provider- and model-neutral: any identity arguments are ignored.
+   */
+  async canContinue(changeId) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      await this.#refreshBudgets();
+      return !this.#getOrInitBudget(changeId).escalation;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Reset durable budget counters. Host-only: model-facing callers are
+   * denied and the budget is left untouched. Audited as BUDGET_RESET.
+   */
+  async resetBudget(changeId, { actorType, actor } = {}) {
+    if (actorType !== 'human') {
+      throw Object.assign(new Error('Budget reset denied: host (human) actor required'), { code: 'FORBIDDEN' });
+    }
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      await this.#refreshBudgets();
+      const b = this.#getOrInitBudget(changeId);
+      for (const key of Object.keys(b.counters)) b.counters[key] = 0;
+      b.escalation = null;
+      b.overriddenLimits = [];
+      const ts = new Date().toISOString();
+      await reseedFromDisk(this.#file);
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId,
+        type: 'BUDGET_RESET',
+        ...(actor !== undefined ? { actor } : {}),
+        ts,
+      });
+      await this.#persist();
+      return this.#projectBudget(b);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Human override of a budget escalation/threshold. Requires an identified
+   * human actor and is explicitly audited as BUDGET_OVERRIDE.
+   */
+  async overrideBudget(changeId, { actorType, actor, reason } = {}) {
+    if (actorType !== 'human') {
+      throw Object.assign(new Error('Budget override denied: human actor required'), { code: 'FORBIDDEN' });
+    }
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      await this.#refreshBudgets();
+      const b = this.#getOrInitBudget(changeId);
+      const ts = new Date().toISOString();
+      // Grant runway: every currently breached threshold is waived until a
+      // later resetBudget, so the next permitted event does not instantly
+      // re-escalate. The remediation is audited on the override event.
+      const waived = Object.entries(BUDGET_LIMIT_FOR_COUNTER)
+        .filter(([counterKey]) => b.counters[counterKey] > (this.#budgetPolicy?.[BUDGET_LIMIT_FOR_COUNTER[counterKey]] ?? Infinity))
+        .map(([, limitKey]) => limitKey);
+      b.overriddenLimits = [...new Set([...b.overriddenLimits, ...waived])];
+      b.override = { actor, reason: reason ?? null, at: ts, waived };
+      b.escalation = null;
+      await reseedFromDisk(this.#file);
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId,
+        type: 'BUDGET_OVERRIDE',
+        actor,
+        waivedLimits: waived,
+        ...(reason !== undefined ? { reason } : {}),
+        ts,
+      });
+      await this.#persist();
+      return this.#projectBudget(b);
     } finally {
       release();
     }
