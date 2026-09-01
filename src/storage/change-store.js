@@ -165,6 +165,8 @@ export class ChangeStore {
   #dirtyReviews = new Set();
   /** @type {Set<string>} Keys of locally mutated bindings (changeId:sessionId) */
   #dirtyBindings = new Set();
+  /** @type {Set<string>} Keys of locally removed bindings (changeId:sessionId) — deletion wins in #persist */
+  #removedBindings = new Set();
   /** @type {Set<string>} Keys of locally mutated repair claims (changeId) */
   #dirtyRepairClaims = new Set();
   /** @type {{requiredChecks: Array<string|object>, protectedPaths: string[]} | null} */
@@ -437,6 +439,10 @@ export class ChangeStore {
         mergedBindings.set(key, b);
       }
     }
+    // Locally removed bindings delete from disk as well.
+    for (const key of this.#removedBindings) {
+      mergedBindings.delete(key);
+    }
 
     // Merge attempts: union by attemptId, prefer local.
     const diskAttempts = Array.isArray(diskData?.attempts) ? diskData.attempts : [];
@@ -511,6 +517,7 @@ export class ChangeStore {
     });
     // Clear dirty flags after successful persist.
     this.#dirtyBindings.clear();
+    this.#removedBindings.clear();
     this.#dirtyReviews.clear();
     this.#dirtyRepairClaims.clear();
   }
@@ -833,6 +840,42 @@ export class ChangeStore {
       this.#dirtyBindings.add(`${changeId}:${sessionId}`);
       await this.#persist();
       return structuredClone(binding);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Remove a session's role binding from a Change (host/manual unbind).
+   * Rejects when the Change or the binding does not exist. Emits an audit
+   * event and deletes the binding durably (removal wins over disk state).
+   */
+  async unbindRole(changeId, sessionId) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      const changeBindings = this.#bindings.get(changeId) ?? [];
+      const idx = changeBindings.findIndex((b) => b.sessionId === sessionId);
+      if (idx < 0) {
+        throw Object.assign(new Error(`No binding for session ${sessionId} on change ${changeId}`), { code: 'NOT_FOUND' });
+      }
+      changeBindings.splice(idx, 1);
+      this.#bindings.set(changeId, changeBindings);
+      const key = `${changeId}:${sessionId}`;
+      this.#dirtyBindings.delete(key);
+      this.#removedBindings.add(key);
+      await reseedFromDisk(this.#file);
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId,
+        type: 'UNBIND',
+        sessionId,
+        ts: new Date().toISOString(),
+      });
+      await this.#persist();
+      return { removed: true, changeId, sessionId };
     } finally {
       release();
     }

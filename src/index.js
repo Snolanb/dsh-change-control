@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { registerChangeTools } from './tools/change-tools.js';
+import { registerChangeTools, registerChangeCommands } from './tools/change-tools.js';
 import { createFilesystemPolicy } from './tools/filesystem-policy.js';
 import { RISK_LEVELS } from './domain/change.js';
 
@@ -60,6 +60,15 @@ async function apply(ctx, config) {
 
   // Initialize ChangeStore from config and register the narrow model-facing Change tools
   const store = await registerChangeTools(ctx, config);
+
+  // Register host-side manual /change-* commands when the host exposes a
+  // commands service (absent in tool-only compositions; the model-facing tools
+  // stay authoritative there).
+  let commands;
+  try { commands = ctx.commands; } catch { commands = null; }
+  if (commands && typeof commands.register === 'function') {
+    registerChangeCommands(commands, store);
+  }
 
   // Wire up the filesystem/tool policy pre-execute interceptor.
   // The policy reads the store's role bindings and change states to gate
