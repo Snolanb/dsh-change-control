@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { registerChangeTools } from './tools/change-tools.js';
+import { registerChangeTools, registerChangeCommands } from './tools/change-tools.js';
 import { createFilesystemPolicy } from './tools/filesystem-policy.js';
 import { RISK_LEVELS } from './domain/change.js';
 
@@ -61,6 +61,20 @@ async function apply(ctx, config) {
   // Initialize ChangeStore from config and register the narrow model-facing Change tools
   const store = await registerChangeTools(ctx, config);
 
+  // Register host-side manual /change-* commands when the host exposes a
+  // commands service (absent in tool-only compositions; the model-facing tools
+  // stay authoritative there). 'commands' is intentionally not in the inject
+  // list: cordis would block plugin startup on hosts without it. Instead, a
+  // host that advertises commands must accept them — a malformed or failing
+  // commands.register throws loudly rather than silently registering nothing.
+  // The returned disposers are retained and released on teardown.
+  let commands;
+  try { commands = ctx.commands; } catch { commands = null; }
+  let commandDisposers = [];
+  if (commands) {
+    commandDisposers = registerChangeCommands(commands, store);
+  }
+
   // Wire up the filesystem/tool policy pre-execute interceptor.
   // The policy reads the store's role bindings and change states to gate
   // tool execution at the real DSH interception boundary.
@@ -72,7 +86,11 @@ async function apply(ctx, config) {
   ctx.effect(() => {
     // Initialization logic runs exactly once per context
     return () => {
-      // Cleanup logic - releases all owned resources
+      // Release the host command registrations on plugin teardown.
+      for (const dispose of commandDisposers) {
+        try { if (typeof dispose === 'function') dispose(); } catch { /* teardown best-effort */ }
+      }
+      commandDisposers = [];
     };
   });
 }

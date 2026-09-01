@@ -2,7 +2,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { ChangeService, AuthorizationError } from '../change-control.js';
 import { ChangeStore } from '../storage/change-store.js';
-import { TRANSITIONS, ChangeDomainError } from '../domain/change.js';
+import { TRANSITIONS, ChangeDomainError, RISK_LEVELS } from '../domain/change.js';
 
 /**
  * Validate changeId is a valid UUID before any store access.
@@ -205,11 +205,173 @@ export function createChangeTools(store) {
 
 export async function registerChangeTools(ctx, config) {
   const storePath = config?.storePath || '.changes.json';
-  const store = await ChangeStore.open(storePath);
+  // Preflight policy honors the established config.policy contract first;
+  // the top-level preflightPolicy key is retained for legacy wiring.
+  const preflightPolicy = config?.policy?.preflightPolicy ?? config?.preflightPolicy;
+  const store = await ChangeStore.open(storePath, { preflightPolicy });
   ctx.provide('changeStore', store);
   const tools = createChangeTools(store);
   const registry = ctx.tools;
   if (!registry?.register) throw new Error('tools.register not available');
   for (const tool of tools) registry.register(tool);
   return store;
+}
+
+// ─── Host-side manual Change commands (/change-*) ────────────────────────────
+// Registered at the host command boundary (ctx.commands) for human operators.
+// They bypass the model-facing tool layer but delegate all persistence,
+// transitions, plan lifecycle, bindings, proof, and preflight to the canonical
+// ChangeStore methods above. Authorization derives from the invocation
+// context (the invoking host agent), never from payload fields.
+
+/** Canonical role vocabulary — mirrors the roles in change-control.js ACTIONS. */
+const CANONICAL_ROLES = Object.freeze(['planner', 'worker', 'reviewer']);
+
+function parseCommandArgs(invocation) {
+  const raw = invocation?.rawInput;
+  let args;
+  if (raw == null || raw === '') {
+    args = {};
+  } else {
+    try {
+      args = JSON.parse(raw);
+    } catch {
+      throw Object.assign(new Error('Invalid arguments: expected a JSON object, e.g. {"changeId":"..."}'), { code: 'INVALID_ARGS' });
+    }
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    throw Object.assign(new Error('Invalid arguments: expected a JSON object, e.g. {"changeId":"..."}'), { code: 'INVALID_ARGS' });
+  }
+  return args;
+}
+
+/**
+ * Derive the host actor from the invocation context. A payload sessionId that
+ * disagrees with the invoking identity is impersonation, except for commands
+ * declared with `sessionKeyAllowed` where sessionId is the *target* session.
+ */
+function deriveHostActor(invocation, args, sessionKeyAllowed) {
+  const id = invocation?.agent?.id;
+  if (typeof id !== 'string' || id.trim() === '') {
+    throw new AuthorizationError('IDENTITY_MISSING', 'Host identity must be derived from invocation context');
+  }
+  if (!sessionKeyAllowed && args.sessionId !== undefined && args.sessionId !== id) {
+    throw new AuthorizationError('SESSION_IMPERSONATION', 'Payload sessionId does not match invoking host identity');
+  }
+  return id;
+}
+
+function requireStringArg(args, key) {
+  const value = args[key];
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw Object.assign(new Error(`${key} is required and must be a non-empty string`), { code: 'INVALID_ARGS' });
+  }
+  return value;
+}
+
+function defineHostCommand(name, description, hint, run, { sessionKeyAllowed = false } = {}) {
+  return {
+    name,
+    description,
+    input: { hint: `${hint} (JSON object)` },
+    handler: async (invocation) => {
+      try {
+        const args = parseCommandArgs(invocation);
+        const actor = deriveHostActor(invocation, args, sessionKeyAllowed);
+        const value = await run(args, actor);
+        return { kind: 'success', text: JSON.stringify(value) };
+      } catch (err) {
+        return { kind: 'error', text: err?.message ?? String(err) };
+      }
+    },
+  };
+}
+
+/** Canonical status projection: state, risk, accepted plan, bindings, revision, proof, preflight, open findings. */
+async function changeStatusProjection(store, changeId) {
+  const change = await store.get(changeId);
+  const bindings = (await store.listRoleBindings()).filter((b) => b.changeId === changeId);
+  const attempts = await store.listAttempts(changeId);
+  const revision = attempts.length > 0 ? attempts[attempts.length - 1].revision ?? null : null;
+  const proof = await store.getProof(changeId).catch(() => null);
+  const preflight = await store.getPreflight(changeId).catch(() => null);
+  const acceptedPlan = change.acceptedPlanId ? await store.getPlan(change.acceptedPlanId).catch(() => null) : null;
+  let openFindings = [];
+  try {
+    // Canonical projection: whatever getRepairContext reports, no command-layer filtering.
+    openFindings = (await store.getRepairContext(changeId)).unresolvedFindings;
+  } catch { /* no reviews yet */ }
+  return {
+    id: change.id,
+    title: change.title,
+    objective: change.objective,
+    state: change.state,
+    risk: change.risk,
+    acceptedPlan,
+    bindings,
+    revision,
+    proof,
+    preflight,
+    openFindings,
+  };
+}
+
+/**
+ * Register the eight manual Change commands on a host command registry.
+ * Returns the registry-supplied disposers so the caller can release them on teardown.
+ * @param {{register: (definition: object) => unknown}} registry ctx.commands
+ * @param {import('../storage/change-store.js').ChangeStore} store
+ */
+export function registerChangeCommands(registry, store) {
+  if (!registry || typeof registry.register !== 'function') {
+    throw new Error('commands.register not available');
+  }
+  const definitions = [
+    defineHostCommand('change-new', 'Create a Change without an LLM', '{"title":"...","objective":"...","acceptanceCriteria":[],"risk":"low|normal|high"}',
+      async (args) => {
+        if (args.risk !== undefined && !RISK_LEVELS.includes(args.risk)) {
+          throw Object.assign(new Error(`Invalid risk: ${args.risk}; expected one of ${RISK_LEVELS.join(', ')}`), { code: 'INVALID_RISK' });
+        }
+        const change = await store.create({
+          title: requireStringArg(args, 'title'),
+          objective: requireStringArg(args, 'objective'),
+          acceptanceCriteria: Array.isArray(args.acceptanceCriteria) ? args.acceptanceCriteria : [],
+        });
+        // Effective risk goes through the canonical host risk API so audit,
+        // downgrade protection, and gate invalidation all apply.
+        return args.risk !== undefined ? store.setRisk(change.id, args.risk) : change;
+      }),
+    defineHostCommand('change-status', 'Show canonical Change status projection', '{"changeId":"..."}',
+      async (args) => changeStatusProjection(store, requireStringArg(args, 'changeId'))),
+    defineHostCommand('change-plan', 'Submit a plan revision for a Change', '{"changeId":"...","content":{}}',
+      async (args) => {
+        if (!args.content || typeof args.content !== 'object' || Array.isArray(args.content)) {
+          throw Object.assign(new Error('content is required and must be an object'), { code: 'INVALID_CONTENT' });
+        }
+        const plan = await store.submitPlan(requireStringArg(args, 'changeId'), args.content);
+        return { planId: plan.id, status: plan.status };
+      }),
+    defineHostCommand('change-approve-plan', 'Accept the current PLANNED plan revision', '{"changeId":"...","planId":"..."}',
+      async (args, actor) => store.acceptPlan(requireStringArg(args, 'changeId'), requireStringArg(args, 'planId'), { authorized: true, actor })),
+    defineHostCommand('change-bind', 'Bind a session to a role on a Change', '{"changeId":"...","sessionId":"...","role":"planner|worker|reviewer"}',
+      async (args) => {
+        const role = requireStringArg(args, 'role');
+        if (!CANONICAL_ROLES.includes(role)) {
+          throw Object.assign(new Error(`Invalid role: ${role}; expected one of ${CANONICAL_ROLES.join(', ')}`), { code: 'INVALID_ROLE' });
+        }
+        return store.bindRole(requireStringArg(args, 'changeId'), requireStringArg(args, 'sessionId'), role);
+      }, { sessionKeyAllowed: true }),
+    defineHostCommand('change-unbind', 'Remove a session role binding from a Change', '{"changeId":"...","sessionId":"..."}',
+      async (args, actor) => store.unbindRole(requireStringArg(args, 'changeId'), requireStringArg(args, 'sessionId'), { actor }),
+      { sessionKeyAllowed: true }),
+    defineHostCommand('change-history', 'Show the chronological audit history for a Change', '{"changeId":"..."}',
+      async (args) => store.history(requireStringArg(args, 'changeId'))),
+    defineHostCommand('change-preflight', 'Run or retry canonical preflight for a Change', '{"changeId":"...","currentRevision":"...","changedFiles":[],"checkResults":[]}',
+      async (args) => store.runPreflight(requireStringArg(args, 'changeId'), {
+        currentRevision: args.currentRevision,
+        changedFiles: args.changedFiles,
+        checkResults: args.checkResults,
+      })),
+  ];
+  return definitions.map((definition) => registry.register(definition));
 }
