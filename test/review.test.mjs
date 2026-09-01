@@ -299,6 +299,92 @@ test('stale revision is rejected at submit time', async () => {
   }
 });
 
+// Repair-cycle acceptance tests (finding-addressed repairs).
+async function repairFixture() {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-repair-cycle-'));
+  const file = join(dir, 'changes.json');
+  const store = await ChangeStore.open(file);
+  const change = await store.create(input);
+  for (const state of ['PLANNED', 'READY', 'IMPLEMENTING', 'PREFLIGHT', 'REVIEW']) await store.transition(change.id, state);
+  await store.recordAttempt(change.id, { attemptId: 'impl-1', workerId: 'worker-1', revision: 'impl-1', status: 'completed' });
+  await store.bindRole(change.id, 'reviewer-session', 'reviewer');
+  const review = await store.submitReview(change.id, { verdict: 'fail', revision: 'impl-1', findings: [finding('critical')] }, { sessionId: 'reviewer-session' });
+  return { dir, file, store, change, review, findingId: review.findings[0].id };
+}
+
+test('REPAIR worker query exposes unresolved blocking findings', async () => {
+  const f = await repairFixture();
+  try {
+    const context = await f.store.getRepairContext(f.change.id);
+    assert.equal(context.state, 'REPAIR');
+    assert.deepEqual(context.unresolvedFindings.map((x) => x.id), [f.findingId]);
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
+test('fixed repair records worker claim without closing reviewer finding', async () => {
+  const f = await repairFixture();
+  try {
+    const result = await f.store.submitRepair(f.change.id, { findings: [{ findingId: f.findingId, status: 'fixed', claim: 'revoked old key' }], proof: { bundleId: 'proof-2', beforeRevision: 'impl-1', afterRevision: 'impl-2' } }, { workerId: 'worker-1' });
+    assert.equal(result.state, 'PREFLIGHT');
+    const context = await f.store.getRepairContext(f.change.id);
+    assert.equal(context.unresolvedFindings[0].id, f.findingId);
+    assert.equal(context.repairClaims[0].status, 'fixed');
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
+test('re-review exposes original finding, repair claim, new revision, proof, and preflight', async () => {
+  const f = await repairFixture();
+  try {
+    const proof = { bundleId: 'proof-2', beforeRevision: 'impl-1', afterRevision: 'impl-2' };
+    await f.store.submitRepair(f.change.id, { findings: [{ findingId: f.findingId, status: 'fixed', claim: 'fixed' }], proof }, { workerId: 'worker-1' });
+    await f.store.recordAttempt(f.change.id, { attemptId: 'impl-2', workerId: 'worker-1', revision: 'impl-2', status: 'completed' });
+    await f.store.transition(f.change.id, 'REVIEW');
+    const context = await f.store.getRepairContext(f.change.id);
+    assert.equal(context.preflight.state, 'REVIEW');
+    assert.equal(context.originalFindings[0].id, f.findingId);
+    assert.equal(context.repairClaims[0].findingId, f.findingId);
+    assert.equal(context.revision, 'impl-2');
+    assert.deepEqual(context.proof, proof);
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
+test('repair history, findings, claims, and revisions survive restart', async () => {
+  const f = await repairFixture();
+  try {
+    const proof = { bundleId: 'proof-2', beforeRevision: 'impl-1', afterRevision: 'impl-2' };
+    await f.store.submitRepair(f.change.id, { findings: [{ findingId: f.findingId, status: 'fixed', claim: 'fixed' }], proof }, { workerId: 'worker-1' });
+    await f.store.recordAttempt(f.change.id, { attemptId: 'impl-2', workerId: 'worker-1', revision: 'impl-2', status: 'completed' });
+    const reopened = await ChangeStore.open(f.file);
+    assert.equal((await reopened.listReviews(f.change.id)).length, 1);
+    const context = await reopened.getRepairContext(f.change.id);
+    assert.equal(context.originalFindings[0].id, f.findingId);
+    assert.equal(context.repairClaims[0].findingId, f.findingId);
+    assert.deepEqual(context.proof, proof);
+    assert.deepEqual((await reopened.listAttempts(f.change.id)).map((x) => x.revision), ['impl-1', 'impl-2']);
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
+test('reviewer change_get exposes repair context in REVIEW state', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-review-'));
+  try {
+    const file = join(dir, 'changes.json');
+    const store = await ChangeStore.open(file);
+    const change = await store.create(input);
+    for (const state of ['PLANNED', 'READY', 'IMPLEMENTING', 'PREFLIGHT', 'REVIEW']) await store.transition(change.id, state);
+    await store.recordAttempt(change.id, { attemptId: 'impl-1', workerId: 'worker-1', revision: 'impl-1', status: 'completed' });
+    await store.bindRole(change.id, 'reviewer-session', 'reviewer');
+    const review = await store.submitReview(change.id, { verdict: 'fail', revision: 'impl-1', findings: [finding('critical')] }, { sessionId: 'reviewer-session' });
+    // The review already transitioned to REPAIR, submit repair to get to PREFLIGHT
+    await store.submitRepair(change.id, { findings: [{ findingId: review.findings[0].id, status: 'fixed', claim: 'fixed' }], proof: { bundleId: 'proof-2', beforeRevision: 'impl-1', afterRevision: 'impl-2' } }, { workerId: 'worker-1' });
+    // Now in PREFLIGHT, transition to REVIEW for re-review context
+    await store.transition(change.id, 'REVIEW');
+    // Reviewer should see repair context via getRepairContext
+    const context = await store.getRepairContext(change.id);
+    assert.equal(context.state, 'REVIEW');
+    assert.ok(context.unresolvedFindings !== undefined, 'getRepairContext should expose unresolvedFindings in REVIEW');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test('cross-instance review visibility', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-review-'));
   try {
