@@ -2123,8 +2123,8 @@ export class ChangeStore {
    * denied and the budget is left untouched. Audited as BUDGET_RESET.
    */
   async resetBudget(changeId, { actorType, actor } = {}) {
-    if (actorType !== 'human') {
-      throw Object.assign(new Error('Budget reset denied: host (human) actor required'), { code: 'FORBIDDEN' });
+    if (actorType !== 'human' || typeof actor !== 'string' || !actor.trim()) {
+      throw Object.assign(new Error('Budget reset denied: identified human actor required'), { code: 'FORBIDDEN' });
     }
     const release = await acquireLock(this.#file);
     try {
@@ -2157,8 +2157,8 @@ export class ChangeStore {
    * human actor and is explicitly audited as BUDGET_OVERRIDE.
    */
   async overrideBudget(changeId, { actorType, actor, reason } = {}) {
-    if (actorType !== 'human') {
-      throw Object.assign(new Error('Budget override denied: human actor required'), { code: 'FORBIDDEN' });
+    if (actorType !== 'human' || typeof actor !== 'string' || !actor.trim()) {
+      throw Object.assign(new Error('Budget override denied: identified human actor required'), { code: 'FORBIDDEN' });
     }
     const release = await acquireLock(this.#file);
     try {

@@ -119,3 +119,33 @@ test('retains concurrent budget increments across ChangeStore instances', async 
   const reopened = await ChangeStore.open(file);
   assert.equal((await reopened.getBudget(change.id)).repairAttempts, 40);
 });
+
+// AC6-IDENTITY-001: override requires a concrete human actor identity;
+// missing/blank/invalid identities are rejected before any state or audit mutation.
+test('override rejects missing or blank human actor identity without mutating state', async (t) => {
+  const { store, change } = await setup(t, { maxRepairAttempts: 0 });
+  await store.recordBudgetEvent(change.id, 'repair');
+  const before = await store.getBudget(change.id);
+  const historyBefore = await store.history(change.id);
+  for (const identity of [undefined, '', '   ', 42, null]) {
+    await assert.rejects(
+      () => store.overrideBudget(change.id, { actorType: 'human', actor: identity, reason: 'no identity' }),
+      { code: 'FORBIDDEN' }
+    );
+  }
+  assert.deepEqual(await store.getBudget(change.id), before);
+  assert.deepEqual(await store.history(change.id), historyBefore);
+  // Escalation still stands: nothing was silently cleared by the rejected attempts.
+  assert.equal(await store.canContinue(change.id), false);
+});
+
+test('valid human override persists and audits the concrete actor identity', async (t) => {
+  const { file, store, change } = await setup(t, { maxRepairAttempts: 0 });
+  await store.recordBudgetEvent(change.id, 'repair');
+  await store.overrideBudget(change.id, { actorType: 'human', actor: 'ops@example.test', reason: 'incident approved' });
+  assert.equal((await store.getBudget(change.id)).override.actor, 'ops@example.test');
+  const reopened = await ChangeStore.open(file, { budgetPolicy: { maxRepairAttempts: 0 } });
+  const budget = await reopened.getBudget(change.id);
+  assert.equal(budget.override.actor, 'ops@example.test');
+  assert.ok((await reopened.history(change.id)).some((event) => event.type === 'BUDGET_OVERRIDE' && event.actor === 'ops@example.test'));
+});
