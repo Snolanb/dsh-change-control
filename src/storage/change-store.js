@@ -1650,7 +1650,8 @@ export class ChangeStore {
         }
       }
 
-      // Enforce proof newness: reject if proof equals currently stored proof
+      // Enforce proof newness: refresh durable proofs before duplicate check
+      await this.#refreshProofs();
       const existingProof = this.#proofs.get(changeId);
       if (existingProof) {
         const existingJson = JSON.stringify(existingProof);
