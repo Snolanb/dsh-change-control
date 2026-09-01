@@ -153,6 +153,10 @@ export class ChangeStore {
   #proofs = new Map();
   /** @type {Map<string, Array>} changeId -> controller preflight results */
   #preflightResults = new Map();
+  /** @type {Map<string, Array<{id: string, sessionId: string, verdict: string, revision: string, findings: Array<object>, submittedAt: string, stale: boolean}>>} changeId -> review records (append-only) */
+  #reviews = new Map();
+  /** @type {Set<string>} Keys of locally mutated reviews (changeId) */
+  #dirtyReviews = new Set();
   /** @type {Set<string>} Keys of locally mutated bindings (changeId:sessionId) */
   #dirtyBindings = new Set();
   /** @type {{requiredChecks: Array<string|object>, protectedPaths: string[]} | null} */
@@ -230,6 +234,14 @@ export class ChangeStore {
         this.#preflightResults.set(changeId, results);
       }
     }
+    // Reviews: keyed by changeId, stored as append-only array.
+    if (data.reviews && typeof data.reviews === 'object') {
+      for (const [changeId, reviews] of Object.entries(data.reviews)) {
+        if (Array.isArray(reviews)) {
+          this.#reviews.set(changeId, reviews);
+        }
+      }
+    }
   }
 
   /**
@@ -281,6 +293,15 @@ export class ChangeStore {
       this.#proofs = new Map();
       for (const [changeId, proof] of Object.entries(data.proofs)) {
         this.#proofs.set(changeId, proof);
+      }
+    }
+    // Reload reviews from disk to preserve records from other instances.
+    if (data.reviews && typeof data.reviews === 'object') {
+      this.#reviews = new Map();
+      for (const [changeId, reviews] of Object.entries(data.reviews)) {
+        if (Array.isArray(reviews)) {
+          this.#reviews.set(changeId, reviews);
+        }
       }
     }
     // NOTE: we do NOT replace this.#audit here — local audit entries are
@@ -399,6 +420,16 @@ export class ChangeStore {
       mergedPreflightResults[changeId] = results;
     }
 
+    // Merge reviews: append-only per changeId, dirty local reviews overlay disk.
+    const diskReviews = diskData?.reviews && typeof diskData.reviews === 'object' ? diskData.reviews : {};
+    const mergedReviews = { ...diskReviews };
+    for (const [changeId, reviews] of this.#reviews) {
+      // Only dirty (locally mutated) reviews override disk.
+      if (this.#dirtyReviews.has(changeId)) {
+        mergedReviews[changeId] = reviews;
+      }
+    }
+
     await writeJson(this.#file, {
       changes: [...mergedChanges.values().filter((c) => c)],
       preflightResults: mergedPreflightResults,
@@ -408,9 +439,11 @@ export class ChangeStore {
       bindings: [...mergedBindings.values()],
       attempts: [...mergedAttempts.values()],
       proofs: mergedProofs,
+      reviews: mergedReviews,
     });
     // Clear dirty flags after successful persist.
     this.#dirtyBindings.clear();
+    this.#dirtyReviews.clear();
   }
 
   async create(input) {
@@ -772,14 +805,14 @@ export class ChangeStore {
   /**
    * Record an implementation attempt for a Change, independent of session identity.
    */
-  async recordAttempt(changeId, { attemptId, workerId, status }) {
+  async recordAttempt(changeId, { attemptId, workerId, status, revision } = {}) {
     const release = await acquireLock(this.#file);
     try {
       await this.#refreshChange(changeId);
       const c = this.#changes.get(changeId);
       if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
 
-      const attempt = { changeId, attemptId, workerId, status, recordedAt: new Date().toISOString() };
+      const attempt = { changeId, attemptId, workerId, status, recordedAt: new Date().toISOString(), revision: revision || null };
       const changeAttempts = this.#attempts.get(changeId) ?? [];
       changeAttempts.push(attempt);
       this.#attempts.set(changeId, changeAttempts);
@@ -1213,5 +1246,225 @@ export class ChangeStore {
    */
   async _persist() {
     await this.#persist();
+  }
+
+  // ─── Review submission ────────────────────────────────────────────────────
+
+  /**
+   * Submit a review for a Change. Requires reviewer role binding.
+   * Validates findings: important/critical require requiredOutcome.
+   * Assigns unique immutable IDs to accepted findings.
+   * Transitions change based on verdict AND blocking severity.
+   */
+  async submitReview(changeId, review, opts = {}) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+
+      // Validate change is in REVIEW state
+      if (c.state !== 'REVIEW') {
+        throw Object.assign(new Error(`Cannot submit review: change is in ${c.state}, expected REVIEW`), { code: 'INVALID_STATE' });
+      }
+
+      // Validate reviewer session ID from opts
+      const sessionId = opts.sessionId;
+      if (!sessionId || typeof sessionId !== 'string') {
+        throw Object.assign(new Error('sessionId is required'), { code: 'INVALID_REVIEW' });
+      }
+
+      // Validate reviewer role binding
+      const bindingRole = (this.#bindings.get(changeId) ?? []).find((b) => b.sessionId === sessionId)?.role;
+      if (!bindingRole) {
+        throw Object.assign(new Error(`No binding found for session ${sessionId}`), { code: 'SESSION_NOT_BOUND' });
+      }
+      if (bindingRole !== 'reviewer') {
+        throw Object.assign(new Error(`Session ${sessionId} has role ${bindingRole}, expected reviewer`), { code: 'ROLE_NOT_ALLOWED' });
+      }
+
+      // Reject if reviewer session appears as workerId in any recorded attempt (self-review)
+      const attempts = this.#attempts.get(changeId) ?? [];
+      if (attempts.some((a) => a.workerId === sessionId)) {
+        throw Object.assign(new Error(`Session ${sessionId} has recorded implementation attempts on this change`), { code: 'REVIEWER_NOT_INDEPENDENT' });
+      }
+
+      // Validate review structure
+      if (!review || typeof review !== 'object') {
+        throw Object.assign(new Error('Review is required'), { code: 'INVALID_REVIEW' });
+      }
+      if (!review.verdict || typeof review.verdict !== 'string') {
+        throw Object.assign(new Error('verdict is required'), { code: 'INVALID_REVIEW' });
+      }
+      if (review.verdict !== 'pass' && review.verdict !== 'fail') {
+        throw Object.assign(new Error('verdict must be "pass" or "fail"'), { code: 'INVALID_REVIEW' });
+      }
+      // Require non-empty string revision (trim check)
+      if (!review.revision || typeof review.revision !== 'string' || String(review.revision).trim() === '') {
+        throw Object.assign(new Error('revision is required and must be a non-empty string'), { code: 'INVALID_REVIEW' });
+      }
+
+      // Reject stale review: review.revision must match current implementation revision
+      const currentRevision = attempts.length > 0
+        ? attempts[attempts.length - 1].revision || null
+        : null;
+      // Require at least one recorded attempt with a revision
+      if (!currentRevision) {
+        throw Object.assign(new Error('No recorded implementation attempt with revision'), { code: 'STALE_REVISION' });
+      }
+      if (review.revision !== currentRevision) {
+        throw Object.assign(new Error(`Stale review: revision ${review.revision} does not match current implementation revision ${currentRevision}`), { code: 'STALE_REVISION' });
+      }
+
+      if (!Array.isArray(review.findings)) {
+        throw Object.assign(new Error('findings must be an array'), { code: 'INVALID_REVIEW' });
+      }
+
+      // Reject fail verdict with empty findings (nothing for repairer to act on)
+      if (review.verdict === 'fail' && review.findings.length === 0) {
+        throw Object.assign(new Error('fail verdict requires at least one finding'), { code: 'INVALID_REVIEW' });
+      }
+
+      // Validate findings: all fields required, whitespace-only rejected
+      for (const finding of review.findings) {
+        if (!finding || typeof finding !== 'object') {
+          throw Object.assign(new Error('Each finding must be an object'), { code: 'INVALID_FINDING' });
+        }
+        if (!finding.severity || String(finding.severity).trim() === '') {
+          throw Object.assign(new Error('severity is required'), { code: 'INVALID_REVIEW' });
+        }
+        if (!['info', 'minor', 'important', 'critical'].includes(finding.severity)) {
+          throw Object.assign(new Error(`Invalid severity: ${finding.severity}`), { code: 'INVALID_FINDING' });
+        }
+        if (!finding.category || String(finding.category).trim() === '') {
+          throw Object.assign(new Error('category is required'), { code: 'INVALID_REVIEW' });
+        }
+        if (!finding.location || String(finding.location).trim() === '') {
+          throw Object.assign(new Error('location is required'), { code: 'INVALID_REVIEW' });
+        }
+        if (!finding.problem || String(finding.problem).trim() === '') {
+          throw Object.assign(new Error('problem is required'), { code: 'INVALID_REVIEW' });
+        }
+        if (!finding.requiredOutcome || String(finding.requiredOutcome).trim() === '') {
+          throw Object.assign(new Error('requiredOutcome is required'), { code: 'INVALID_REVIEW' });
+        }
+      }
+
+      // Assign unique immutable IDs to findings and freeze
+      const now = new Date().toISOString();
+      const acceptedFindings = Object.freeze(
+        review.findings.map((f, idx) => {
+          const id = `finding-${Date.now()}-${idx}-${crypto.randomUUID().slice(0, 8)}`;
+          return Object.freeze({
+            id,
+            severity: f.severity,
+            category: f.category,
+            location: f.location,
+            problem: f.problem,
+            requiredOutcome: f.requiredOutcome,
+          });
+        })
+      );
+
+      // Compute hasBlocking once from acceptedFindings
+      const hasBlocking = acceptedFindings.some((f) => f.severity === 'important' || f.severity === 'critical');
+
+      // Derive state from verdict AND blocking severity
+      let newState;
+      if (review.verdict === 'pass') {
+        if (hasBlocking) {
+          throw Object.assign(new Error('pass verdict with blocking findings is invalid'), { code: 'INVALID_REVIEW' });
+        }
+        newState = 'APPROVED';
+      } else {
+        // fail verdict: always route to REPAIR
+        newState = 'REPAIR';
+      }
+
+      // Build and freeze review record
+      const reviewRecord = Object.freeze({
+        id: crypto.randomUUID(),
+        sessionId,
+        verdict: review.verdict,
+        revision: review.revision,
+        findings: acceptedFindings,
+        submittedAt: now,
+        stale: false,
+      });
+
+      // Append review to append-only array
+      const changeReviews = this.#reviews.get(changeId) ?? [];
+      changeReviews.push(reviewRecord);
+      this.#reviews.set(changeId, changeReviews);
+      this.#dirtyReviews.add(changeId);
+
+      // Transition the change
+      const before = c.state;
+      c.transitionTo(newState);
+
+      await reseedFromDisk(this.#file);
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId,
+        from: before,
+        to: newState,
+        ts: c.updatedAt,
+      });
+
+      await this.#persist();
+
+      return Object.freeze({
+        ...reviewRecord,
+        state: newState,
+      });
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Retrieve the persisted (latest) review for a Change.
+   * Returns stale=true when current implementation revision differs from review.revision.
+   */
+  async getReview(changeId) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      const reviews = this.#reviews.get(changeId);
+      if (!reviews || reviews.length === 0) throw Object.assign(new Error(`No review found for change ${changeId}`), { code: 'NOT_FOUND' });
+
+      // Get latest review
+      const latest = reviews[reviews.length - 1];
+      const result = structuredClone(latest);
+
+      // Check staleness: compare review.revision with current implementation revision
+      const attempts = this.#attempts.get(changeId) ?? [];
+      const currentRevision = attempts.length > 0 ? (attempts[attempts.length - 1].revision || null) : null;
+      if (currentRevision && latest.revision && currentRevision !== latest.revision) {
+        result.stale = true;
+      }
+
+      return result;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * List all review records for a Change, ordered by submission time.
+   */
+  async listReviews(changeId) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      const reviews = this.#reviews.get(changeId) ?? [];
+      return structuredClone(reviews);
+    } finally {
+      release();
+    }
   }
 }
