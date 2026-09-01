@@ -57,10 +57,10 @@ async function transitionWithStructure(store, changeId, nextState) {
 
 /**
  * Map domain state to ChangeService auth state.
- * Single source of truth: DRAFT/PLANNED→PLANNING, IMPLEMENTING→PROOF, PREFLIGHT→REVIEW, REVIEW→REPAIR.
+ * Single source of truth: DRAFT/PLANNED→PLANNING, IMPLEMENTING→PROOF, PREFLIGHT→REVIEW, REVIEW→REVIEW, REPAIR→REPAIR, APPROVED→APPROVED.
  */
 function toAuthState(domainState) {
-  const map = { DRAFT: 'PLANNING', PLANNED: 'PLANNING', IMPLEMENTING: 'PROOF', PREFLIGHT: 'REVIEW', REVIEW: 'REPAIR' };
+  const map = { DRAFT: 'PLANNING', PLANNED: 'PLANNING', IMPLEMENTING: 'PROOF', PREFLIGHT: 'REVIEW', REVIEW: 'REVIEW', REPAIR: 'REPAIR', APPROVED: 'APPROVED' };
   return map[domainState] ?? domainState;
 }
 
@@ -127,28 +127,30 @@ export function createChangeTools(store) {
     }),
     defineTool({
       name: 'change_submit_review',
-      description: 'Submit a review for a Change. Requires reviewer role on PREFLIGHT change.',
-      parameters: { changeId: { type: 'string' }, review: { type: 'string' } },
+      description: 'Submit a review for a Change. Requires reviewer role on REVIEW change with matching revision.',
+      parameters: { changeId: { type: 'string' }, review: { type: 'object', additionalProperties: true } },
       output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => v },
       execute: async (args, exec) => {
         validateChangeId(args.changeId);
-        if (!args.review || typeof args.review !== 'string') {
-          throw Object.assign(new Error('review is required and must be a string'), { code: 'INVALID_REVIEW' });
+        if (!args.review || typeof args.review !== 'object') {
+          throw Object.assign(new Error('review is required and must be an object'), { code: 'INVALID_REVIEW' });
         }
         const { sessionId, role } = await deriveIdentity(args, exec, store);
         const change = await store.get(args.changeId);
+
         const service = new ChangeService({ role, state: toAuthState(change.state), sessionBound: true });
         try { service.submitReview(); } catch (err) {
           if (err instanceof AuthorizationError) throw Object.assign(new Error(err.message), { code: err.reason });
           throw err;
         }
-        await transitionWithStructure(store, args.changeId, 'REVIEW');
-        return { success: true };
+        // Forward structured review to store
+        const result = await store.submitReview(args.changeId, args.review, { sessionId });
+        return result;
       },
     }),
     defineTool({
       name: 'change_submit_repair',
-      description: 'Submit a repair after review. Requires worker role on REVIEW change with accepted plan.',
+      description: 'Submit a repair after review. Requires worker role on REPAIR change with accepted plan.',
       parameters: { changeId: { type: 'string' }, repair: { type: 'string' } },
       output: { schema: { type: 'object', additionalProperties: true }, render: (_a, v) => v },
       execute: async (args, exec) => {
@@ -160,13 +162,20 @@ export function createChangeTools(store) {
         const change = await store.get(args.changeId);
         // V1: Derive planAccepted from persisted store state
         const planAccepted = !!change.acceptedPlanId;
-        const service = new ChangeService({ role, state: toAuthState(change.state), sessionBound: true, planAccepted });
+        // For repair tool, we need to check authorization against REPAIR state
+        // since the change may have just been transitioned to REPAIR by submitReview
+        const service = new ChangeService({ role, state: 'REPAIR', sessionBound: true, planAccepted });
         try { service.submitRepair(); } catch (err) {
           if (err instanceof AuthorizationError) throw Object.assign(new Error(err.message), { code: err.reason });
           throw err;
         }
-        // V5: Transition to REPAIR (host controls REPAIR→PREFLIGHT return)
-        await transitionWithStructure(store, args.changeId, 'REPAIR');
+        // Only allow repair from REPAIR state (transitioned by structured review)
+        // REVIEW→REPAIR is owned by change_submit_review, not change_submit_repair
+        if (change.state !== 'REPAIR') {
+          throw Object.assign(new Error(`Cannot submit repair: change is in ${change.state}, expected REPAIR`), { code: 'INVALID_STATE' });
+        }
+        await transitionWithStructure(store, args.changeId, 'PREFLIGHT');
+        return { success: true };
         return { success: true };
       },
     }),

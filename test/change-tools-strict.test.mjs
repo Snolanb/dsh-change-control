@@ -93,33 +93,49 @@ test('full legal lifecycle executes all five tools with exact state/audit eviden
   await store.transition(change.id, 'IMPLEMENTING');
   assert.equal((await store.get(change.id)).state, 'IMPLEMENTING');
 
-  // 2. Proof: IMPLEMENTING → PREFLIGHT
+  // Record implementation attempt with revision (use worker-session for attempt)
+  await store.recordAttempt(change.id, { attemptId: 'impl-1', workerId: 'worker-session', revision: 'impl-1', status: 'completed' });
+
+  // Submit proof (legal: IMPLEMENTING → PREFLIGHT)
   const proof = await call(registry, 'change_submit_proof', { changeId: change.id, proof: 'tests pass' }, 'worker-session');
   assert.equal(proof.isError, false);
   assert.equal(proof.value?.success, true);
   assert.equal((await store.get(change.id)).state, 'PREFLIGHT');
 
-  // 3. Review: PREFLIGHT → REVIEW
-  const review = await call(registry, 'change_submit_review', { changeId: change.id, review: 'looks good' }, 'reviewer-session');
-  assert.equal(review.isError, false);
-  assert.equal(review.value?.success, true);
+  // Transition PREFLIGHT → REVIEW (separate authorized transition)
+  await store.transition(change.id, 'REVIEW');
   assert.equal((await store.get(change.id)).state, 'REVIEW');
 
-  // 4. Repair: REVIEW → REPAIR
+  // 3. Review: REVIEW → REPAIR (fail with critical finding)
+  const review = await call(registry, 'change_submit_review', {
+    changeId: change.id,
+    review: { verdict: 'fail', revision: 'impl-1', findings: [{ severity: 'critical', category: 'security', location: 'file.js:1', problem: 'Issue', requiredOutcome: 'Fix it' }] }
+  }, 'reviewer-session');
+  assert.equal(review.isError, false);
+  assert.equal(review.value?.state, 'REPAIR');
+  assert.equal((await store.get(change.id)).state, 'REPAIR');
+
+  // 4. Repair: REPAIR → PREFLIGHT
   const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: 'fixed it' }, 'worker-session');
   assert.equal(repair.isError, false);
   assert.equal(repair.value?.success, true);
-  assert.equal((await store.get(change.id)).state, 'REPAIR');
-
-  // Transition REPAIR → PREFLIGHT for re-review
-  await store.transition(change.id, 'PREFLIGHT');
   assert.equal((await store.get(change.id)).state, 'PREFLIGHT');
 
-  // 5. Re-review: PREFLIGHT → REVIEW
-  const review2 = await call(registry, 'change_submit_review', { changeId: change.id, review: 'again' }, 'reviewer-session');
-  assert.equal(review2.isError, false);
-  assert.equal(review2.value?.success, true);
+  // Transition PREFLIGHT → REVIEW for re-review
+  await store.transition(change.id, 'REVIEW');
   assert.equal((await store.get(change.id)).state, 'REVIEW');
+
+  // Record new implementation attempt
+  await store.recordAttempt(change.id, { attemptId: 'impl-2', workerId: 'worker-session', revision: 'impl-2', status: 'completed' });
+
+  // 5. Re-review: REVIEW → APPROVED
+  const review2 = await call(registry, 'change_submit_review', {
+    changeId: change.id,
+    review: { verdict: 'pass', revision: 'impl-2', findings: [] }
+  }, 'reviewer-session');
+  assert.equal(review2.isError, false);
+  assert.equal(review2.value?.state, 'APPROVED');
+  assert.equal((await store.get(change.id)).state, 'APPROVED');
 
   // Verify audit evidence
   const after = (await store.history(change.id)).length;
@@ -130,6 +146,7 @@ test('full legal lifecycle executes all five tools with exact state/audit eviden
   assert.ok(states.includes('PREFLIGHT'));
   assert.ok(states.includes('REVIEW'));
   assert.ok(states.includes('REPAIR'));
+  assert.ok(states.includes('APPROVED'));
 }));
 
 test('V1: proof/repair denied without accepted plan', () => fixture(async ({ store, change, registry }) => {
@@ -158,27 +175,38 @@ test('V2: illegal transition returns structured error with code/current/attempte
   await store.transition(change.id, 'IMPLEMENTING');
   assert.equal((await store.get(change.id)).state, 'IMPLEMENTING');
 
+  // Record implementation attempt with revision (use a different worker session)
+  await store.recordAttempt(change.id, { attemptId: 'impl-1', workerId: 'impl-worker', revision: 'impl-1', status: 'completed' });
+  await store.bindRole(change.id, 'impl-worker', 'worker');
+
   // Submit proof (legal: IMPLEMENTING → PREFLIGHT)
   const proof = await call(registry, 'change_submit_proof', { changeId: change.id, proof: 'done' }, 'worker-session');
   assert.equal(proof.isError, false);
   assert.equal(proof.value?.success, true);
   assert.equal((await store.get(change.id)).state, 'PREFLIGHT');
 
-  // Submit review (legal: PREFLIGHT → REVIEW)
-  const review = await call(registry, 'change_submit_review', { changeId: change.id, review: 'good' }, 'reviewer-session');
-  assert.equal(review.isError, false);
+  // Transition PREFLIGHT → REVIEW (separate authorized transition)
+  await store.transition(change.id, 'REVIEW');
   assert.equal((await store.get(change.id)).state, 'REVIEW');
 
-  // Submit repair (legal: REVIEW → REPAIR)
-  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: 'fixed' }, 'worker-session');
-  assert.equal(repair.isError, false);
+  // Submit review (legal: REVIEW → REPAIR with fail verdict)
+  const review = await call(registry, 'change_submit_review', {
+    changeId: change.id,
+    review: { verdict: 'fail', revision: 'impl-1', findings: [{ severity: 'critical', category: 'security', location: 'file.js:1', problem: 'Issue', requiredOutcome: 'Fix' }] }
+  }, 'reviewer-session');
+  assert.equal(review.isError, false);
   assert.equal((await store.get(change.id)).state, 'REPAIR');
 
-  // Now try illegal transition: proof from REPAIR (should fail)
+  // Submit repair (legal: REPAIR → PREFLIGHT)
+  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: 'fixed' }, 'worker-session');
+  assert.equal(repair.isError, false);
+  assert.equal((await store.get(change.id)).state, 'PREFLIGHT');
+
+  // Now try illegal transition: proof from PREFLIGHT (should fail - need REVIEW first)
   const badProof = await call(registry, 'change_submit_proof', { changeId: change.id, proof: 'late' }, 'worker-session');
   assert.equal(badProof.isError, true);
-  // Should have structured error
-  assert.ok(badProof.error?.message?.includes('cannot submitProof') || badProof.error?.message?.includes('PROOF'), 'Should have structured denial for invalid state');
+  // Should have structured error - auth fails because toAuthState maps PREFLIGHT→REVIEW, not PROOF
+  assert.ok(badProof.error?.message?.includes('submitProof') || badProof.error?.code === 'ROLE_NOT_ALLOWED' || badProof.error?.code === 'INVALID_CHANGE_STATE', 'Should have structured denial for invalid state');
 }));
 
 test('V3: structured denials preserve code/reason through ToolRuntime', () => fixture(async ({ store, change, registry }) => {
@@ -198,4 +226,32 @@ test('V3: structured denials preserve code/reason through ToolRuntime', () => fi
   const unbound = await call(registry, 'change_submit_plan', { changeId: change.id, content: {} }, 'unbound-session');
   assert.equal(unbound.isError, true);
   assert.ok(unbound.error?.code === 'SESSION_NOT_BOUND' || unbound.error?.message?.includes('bound'), 'Should have binding error');
+}));
+
+test('V4: repair from REVIEW without recorded review is rejected (N5 regression)', () => fixture(async ({ store, change, registry }) => {
+  await store.bindRole(change.id, 'planner-session', 'planner');
+  await store.bindRole(change.id, 'worker-session', 'worker');
+  await store.bindRole(change.id, 'reviewer-session', 'reviewer');
+
+  // Submit and accept plan
+  const plan = await call(registry, 'change_submit_plan', { changeId: change.id, content: { steps: ['a'] } }, 'planner-session');
+  assert.equal(plan.isError, false);
+  await store.acceptPlan(change.id, plan.value.planId, { authorized: true });
+  await store.transition(change.id, 'IMPLEMENTING');
+
+  // Record implementation attempt
+  await store.recordAttempt(change.id, { attemptId: 'impl-1', workerId: 'worker-session', revision: 'impl-1', status: 'completed' });
+
+  // Submit proof and transition to REVIEW
+  const proof = await call(registry, 'change_submit_proof', { changeId: change.id, proof: 'done' }, 'worker-session');
+  assert.equal(proof.isError, false);
+  await store.transition(change.id, 'REVIEW');
+  assert.equal((await store.get(change.id)).state, 'REVIEW');
+
+  // Try to submit repair directly from REVIEW (should fail - no review recorded)
+  const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: 'bypass' }, 'worker-session');
+  assert.equal(repair.isError, true);
+  assert.ok(repair.error?.code === 'INVALID_STATE' || repair.error?.message?.includes('expected REPAIR'), 'Should reject repair from REVIEW without prior review');
+  // State should remain REVIEW
+  assert.equal((await store.get(change.id)).state, 'REVIEW');
 }));
