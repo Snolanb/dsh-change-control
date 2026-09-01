@@ -31,7 +31,143 @@ async function resolveBinding(store, sessionId, changeId) {
   const binding = bindings.find((b) => b.sessionId === sessionId && b.changeId === changeId);
   if (!binding) return null;
   const change = await store.get(binding.changeId);
-  return { changeId: binding.changeId, role: binding.role, state: change.state };
+  return { changeId: binding.changeId, role: binding.role, state: change.state, risk: change.risk };
+}
+
+/** Host-effective risk levels, weakest to strongest. */
+const RISK_ORDER = { low: 0, normal: 1, high: 2 };
+
+/** Model-argument keys that can carry a risk claim (normalized spelling). */
+const RISK_CLAIM_KEYS = new Set(['risk', 'effectiverisk', 'risklevel']);
+const normalizeArgKey = (key) => key.toLowerCase().replace(/_/g, '');
+
+/**
+ * Recursively collect model-supplied risk claims anywhere in the argument
+ * tree (key spellings: risk, effectiveRisk, effective_risk, riskLevel,
+ * risk_level). ponytail: depth-capped recursion; model args are JSON.
+ */
+function findRiskClaims(value, depth = 0) {
+  if (depth > 8 || value === null || typeof value !== 'object') return [];
+  const found = [];
+  if (Array.isArray(value)) {
+    for (const item of value) found.push(...findRiskClaims(item, depth + 1));
+    return found;
+  }
+  for (const [key, nested] of Object.entries(value)) {
+    if (RISK_CLAIM_KEYS.has(normalizeArgKey(key)) && typeof nested === 'string') {
+      found.push(nested);
+    } else {
+      found.push(...findRiskClaims(nested, depth + 1));
+    }
+  }
+  return found;
+}
+
+/** Recursively collect truthy approval-style flags in the argument tree. */
+function findApprovalClaims(value, depth = 0) {
+  if (depth > 8 || value === null || typeof value !== 'object') return [];
+  const found = [];
+  if (Array.isArray(value)) {
+    for (const item of value) found.push(...findApprovalClaims(item, depth + 1));
+    return found;
+  }
+  for (const [key, nested] of Object.entries(value)) {
+    if (normalizeArgKey(key).includes('approval') && nested) {
+      found.push(nested);
+    } else if (nested && typeof nested === 'object') {
+      found.push(...findApprovalClaims(nested, depth + 1));
+    }
+  }
+  return found;
+}
+
+/**
+ * Risk-profile enforcement for a bound session. Returns a deny decision or
+ * null. Every fact comes from host-owned stores: the effective risk from
+ * change.risk and gate satisfaction from the store's append-only records —
+ * never from model-supplied arguments.
+ * - AC1: risk must be explicit before implementation-capable actions run.
+ * - AC2: model args may not claim a weaker risk than the host value.
+ * - AC3: configured per-risk gates must be satisfied in host records.
+ * - AC4/AC5: human-controlled gates can only be satisfied through the
+ *   host/human channel, and gate satisfaction is bound to the risk level it
+ *   was recorded under — a risk increase requires fresh, stronger gates.
+ */
+async function evaluateRisk(policyConfig, store, binding, exec) {
+  const args = exec?.arguments ?? {};
+
+  // Explicit opt-in escape hatch for genuinely legacy store paths.
+  if (policyConfig.allowLegacyRisklessChanges === true && binding.risk == null) {
+    return null;
+  }
+
+  const hostRisk = typeof binding.risk === 'string' ? binding.risk.toLowerCase() : null;
+  if (!hostRisk || !(hostRisk in RISK_ORDER)) {
+    // Fail closed: no readable explicit host risk decision.
+    return deny('RISK_NOT_EXPLICIT', `Change ${binding.changeId} has no explicit effective risk; implementation cannot proceed`);
+  }
+
+  // Model-supplied risk claims can never weaken the host decision.
+  for (const claimed of findRiskClaims(args)) {
+    const claim = claimed.toLowerCase();
+    if (claim in RISK_ORDER && RISK_ORDER[claim] < RISK_ORDER[hostRisk]) {
+      return deny('RISK_REDUCTION', `Agent session cannot reduce risk: host effective risk is ${hostRisk}, not ${claimed}`);
+    }
+  }
+
+  // Gate requirements come from host-configured risk profiles. When no
+  // profiles are configured at all there is nothing to enforce; when they
+  // are configured, an absent/undeclared profile for the effective risk
+  // fails closed.
+  const profiles = policyConfig.riskProfiles;
+  if (profiles == null || typeof profiles !== 'object') return null;
+
+  // Only implementation-capable actions consume gates: change-tool
+  // submissions and worker mutations. Pure reads (change_get) pass through.
+  const isGateBearing = (CHANGE_TOOL_NAMES.has(exec.name) && exec.name !== 'change_get')
+    || (!CHANGE_TOOL_NAMES.has(exec.name) && binding.role === 'worker');
+  if (!isGateBearing) return null;
+
+  const profile = profiles[hostRisk] ?? profiles[hostRisk.toUpperCase()];
+  if (!profile || !Array.isArray(profile.requiredChecks)) {
+    return deny('RISK_PROFILE_UNDEFINED', `No declared risk profile for ${hostRisk.toUpperCase()}; configure requiredChecks (or an explicit empty list) to proceed`);
+  }
+  const requiredEntries = profile.requiredChecks;
+  const required = requiredEntries.map(checkName).filter(Boolean);
+  const humanControlled = requiredEntries
+    .filter((entry) => typeof entry === 'object' && entry !== null && entry.control === 'human')
+    .map(checkName).filter(Boolean);
+
+  // A model-facing tool must not supply or assert satisfaction of a
+  // human-controlled gate — neither via checks payloads nor approval flags.
+  if (humanControlled.length > 0) {
+    for (const attempt of findCheckAttempts(args)) {
+      const names = attempt.map(checkName).filter(Boolean);
+      if (humanControlled.some((hc) => names.includes(hc))) {
+        return deny('HUMAN_GATE_BYPASS', 'Human-controlled gates cannot be satisfied by model-facing tools; they require the host/human approval channel');
+      }
+    }
+    if (findApprovalClaims(args).length > 0) {
+      return deny('HUMAN_GATE_BYPASS', 'Model-facing tools cannot assert human approval for a human-controlled gate');
+    }
+  }
+
+  if (required.length === 0) return null;
+
+  // Gate satisfaction is evaluated against host-owned recorded state only.
+  const satisfaction = typeof store.getGateSatisfaction === 'function'
+    ? await store.getGateSatisfaction(binding.changeId)
+    : [];
+  const satisfied = new Set(
+    (Array.isArray(satisfaction) ? satisfaction : [])
+      .filter((entry) => entry?.risk === hostRisk && typeof entry?.name === 'string')
+      .map((entry) => entry.name)
+  );
+  const missing = required.filter((name) => !satisfied.has(name));
+  if (missing.length > 0) {
+    return deny('RISK_GATE_INCOMPLETE', `${hostRisk.toUpperCase()} risk requires host-recorded satisfaction of all configured gates; missing: ${missing.join(', ')}`);
+  }
+  return null;
 }
 
 /**
@@ -108,6 +244,14 @@ export function createFilesystemPolicy(store, config) {
     if (!binding) return next();
 
     const { changeId, role, state } = binding;
+
+    // Host-owned risk-profile gate: effective risk and gates are derived from
+    // the store and policy config, never from model-supplied arguments.
+    const riskDecision = await evaluateRisk(policyConfig, store, binding, exec);
+    if (riskDecision) {
+      await auditDenial(store, changeId, exec, agentId, role, state, riskDecision.code);
+      return riskDecision;
+    }
 
     // Allow change-control tools through — they have their own authorization layer.
     if (CHANGE_TOOL_NAMES.has(exec.name)) return next();
