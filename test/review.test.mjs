@@ -481,6 +481,35 @@ test('stale instance claim merge preserves concurrent claims', async () => {
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+// Regression: strict planAccepted authorization (ARK-T3-007)
+test('repair denied without accepted plan - strict authorization', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-review-'));
+  try {
+    const file = join(dir, 'changes.json');
+    const ctx = new Context();
+    await ctx.plugin(SystemPrompt);
+    await ctx.plugin(ToolRuntime);
+    await ctx.plugin({ name, apply, inject: ['tools'] }, { storePath: file });
+    const store = ctx.get('changeStore');
+    const registry = ctx.get('tools');
+    const change = await store.create(input);
+    await store.bindRole(change.id, 'worker-session', 'worker');
+    await store.bindRole(change.id, 'reviewer-session', 'reviewer');
+    // Transition without submitting/accepting plan
+    await store.transition(change.id, 'PLANNED');
+    await store.transition(change.id, 'READY');
+    await store.transition(change.id, 'IMPLEMENTING');
+    await store.recordAttempt(change.id, { attemptId: 'impl-1', workerId: 'worker-session', revision: 'impl-1', status: 'completed' });
+    await store.transition(change.id, 'PREFLIGHT');
+    await store.transition(change.id, 'REVIEW');
+    await store.submitReview(change.id, { verdict: 'fail', revision: 'impl-1', findings: [finding('critical')] }, { sessionId: 'reviewer-session' });
+    // Should fail - no plan accepted
+    const repair = await call(registry, 'change_submit_repair', { changeId: change.id, repair: { findings: [], proof: { bundleId: 'p' } } }, 'worker-session');
+    assert.equal(repair.isError, true);
+    assert.match(JSON.stringify(repair.error), /PLAN_NOT_ACCEPTED|plan.*accepted/i);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test('cross-instance review visibility', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-review-'));
   try {
