@@ -9,7 +9,7 @@
 // @ts-nocheck
 import { readFile, writeFile, rename, unlink } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { createChange, ChangeDomainError, TRANSITIONS } from '../domain/change.js';
+import { createChange, ChangeDomainError, TRANSITIONS, RISK_LEVELS } from '../domain/change.js';
 
 const writeLocks = new Map();
 /** Monotonic counter for collision-free event IDs. Seeded from disk on load. */
@@ -153,6 +153,8 @@ export class ChangeStore {
   #proofs = new Map();
   /** @type {Map<string, Array>} changeId -> controller preflight results */
   #preflightResults = new Map();
+  /** @type {Map<string, Array<{name: string, risk: string, recordedAt: string}>>} changeId -> host-recorded gate satisfaction (append-only) */
+  #gateSatisfaction = new Map();
   /** @type {Map<string, Array<{findingId: string, status: string, claim: string, recordedAt: string}>>} changeId -> repair claims (append-only) */
   #repairClaims = new Map();
   /** @type {Map<string, object>} changeId -> repair proof (last submitted) */
@@ -238,6 +240,12 @@ export class ChangeStore {
     if (data.preflightResults && typeof data.preflightResults === 'object') {
       for (const [changeId, results] of Object.entries(data.preflightResults)) {
         this.#preflightResults.set(changeId, results);
+      }
+    }
+    // Gate satisfaction: keyed by changeId.
+    if (data.gateSatisfaction && typeof data.gateSatisfaction === 'object') {
+      for (const [changeId, entries] of Object.entries(data.gateSatisfaction)) {
+        if (Array.isArray(entries)) this.#gateSatisfaction.set(changeId, entries);
       }
     }
     // Reviews: keyed by changeId, stored as append-only array.
@@ -330,6 +338,12 @@ export class ChangeStore {
         if (Array.isArray(claims)) {
           this.#repairClaims.set(changeId, claims);
         }
+      }
+    }
+    // Reload gate satisfaction from disk.
+    if (data.gateSatisfaction && typeof data.gateSatisfaction === 'object') {
+      for (const [changeId, entries] of Object.entries(data.gateSatisfaction)) {
+        if (Array.isArray(entries)) this.#gateSatisfaction.set(changeId, entries);
       }
     }
     // NOTE: we do NOT replace this.#audit here — local audit entries are
@@ -448,6 +462,13 @@ export class ChangeStore {
       mergedPreflightResults[changeId] = results;
     }
 
+    // Merge gate satisfaction: union by changeId, prefer local.
+    const diskGateSatisfaction = diskData?.gateSatisfaction && typeof diskData.gateSatisfaction === 'object' ? diskData.gateSatisfaction : {};
+    const mergedGateSatisfaction = { ...diskGateSatisfaction };
+    for (const [changeId, entries] of this.#gateSatisfaction) {
+      mergedGateSatisfaction[changeId] = entries;
+    }
+
     // Merge reviews: append-only per changeId, dirty local reviews overlay disk.
     const diskReviews = diskData?.reviews && typeof diskData.reviews === 'object' ? diskData.reviews : {};
     const mergedReviews = { ...diskReviews };
@@ -477,6 +498,7 @@ export class ChangeStore {
     await writeJson(this.#file, {
       changes: [...mergedChanges.values().filter((c) => c)],
       preflightResults: mergedPreflightResults,
+      gateSatisfaction: mergedGateSatisfaction,
       audit: mergedAudit,
       // Plans are kept as a top-level array for direct retrieval.
       plans: [...mergedPlans.values()],
@@ -1135,6 +1157,111 @@ export class ChangeStore {
       const c = this.#changes.get(changeId);
       if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
       return c._requiredChecks ? structuredClone(c._requiredChecks) : null;
+    } finally {
+      release();
+    }
+  }
+
+  // ─── Host-owned risk and gate satisfaction ────────────────────────────────
+  // These methods are exposed on the host-facing store object only; no
+  // model-facing tool registers them, so agent sessions cannot mutate risk
+  // or claim gate satisfaction.
+
+  /**
+   * Set or raise the host-owned effective risk of a change.
+   * Raising risk invalidates every gate satisfaction recorded under the
+   * previous (weaker) level, so stronger gates must be satisfied afresh.
+   * Downgrades are rejected: risk never decreases through this API.
+   * @param {string} changeId
+   * @param {'low'|'normal'|'high'} level
+   */
+  async setRisk(changeId, level) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      if (!RISK_LEVELS.includes(level)) {
+        throw Object.assign(new Error(`Invalid risk level: ${level}`), { code: 'INVALID_RISK' });
+      }
+      const from = c.risk ?? null;
+      if (from === level) return freezeChange(c);
+      if (from && RISK_LEVELS.indexOf(level) < RISK_LEVELS.indexOf(from)) {
+        throw Object.assign(
+          new Error(`Cannot lower risk from ${from} to ${level}`),
+          { code: 'RISK_DOWNGRADE' }
+        );
+      }
+      c.risk = level;
+      c.updatedAt = new Date().toISOString();
+      // Invalidate gate satisfaction captured under the previous level.
+      this.#gateSatisfaction.delete(changeId);
+      await reseedFromDisk(this.#file);
+      this.#audit.push({
+        eventId: nextEventId(),
+        changeId,
+        type: from ? 'RISK_ESCALATION' : 'RISK_SET',
+        from,
+        to: level,
+        ts: c.updatedAt,
+      });
+      await this.#persist();
+      return freezeChange(c);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Record host-observed satisfaction of a configured gate for the change's
+   * current effective risk. Human-controlled gates are satisfied here through
+   * the host/human approval channel — never by model tool arguments.
+   * @param {string} changeId
+   * @param {{name: string}} gate
+   */
+  async recordGateSatisfaction(changeId, gate) {
+    const release = await acquireLock(this.#file);
+    try {
+      await this.#refreshChange(changeId);
+      const c = this.#changes.get(changeId);
+      if (!c) throw Object.assign(new Error(`Change ${changeId} not found`), { code: 'NOT_FOUND' });
+      const name = typeof gate === 'string' ? gate : gate?.name;
+      if (typeof name !== 'string' || name.length === 0) {
+        throw Object.assign(new Error('Gate name is required'), { code: 'INVALID_GATE' });
+      }
+      if (!c.risk) {
+        throw Object.assign(new Error(`Change ${changeId} has no explicit effective risk`), { code: 'RISK_NOT_EXPLICIT' });
+      }
+      const entries = this.#gateSatisfaction.get(changeId) ?? [];
+      if (!entries.some((e) => e.name === name && e.risk === c.risk)) {
+        entries.push({ name, risk: c.risk, recordedAt: new Date().toISOString() });
+        this.#gateSatisfaction.set(changeId, entries);
+        await reseedFromDisk(this.#file);
+        this.#audit.push({
+          eventId: nextEventId(),
+          changeId,
+          type: 'GATE_SATISFIED',
+          gate: name,
+          risk: c.risk,
+          ts: new Date().toISOString(),
+        });
+        await this.#persist();
+      }
+      return true;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Read host-recorded gate satisfaction for a change.
+   * @param {string} changeId
+   * @returns {Promise<Array<{name: string, risk: string, recordedAt: string}>>}
+   */
+  async getGateSatisfaction(changeId) {
+    const release = await acquireLock(this.#file);
+    try {
+      return structuredClone(this.#gateSatisfaction.get(changeId) ?? []);
     } finally {
       release();
     }

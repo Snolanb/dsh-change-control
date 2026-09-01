@@ -44,6 +44,13 @@ function deepFreeze(obj) {
  * Canonical immutable transition ruleset.
  * @type {Readonly<Record<string, readonly string[]>>}
  */
+/**
+ * Canonical risk levels, weakest to strongest. Effective risk is host-owned:
+ * null means no explicit host decision has been recorded yet.
+ * @type {readonly ['low','normal','high']}
+ */
+export const RISK_LEVELS = Object.freeze(['low', 'normal', 'high']);
+
 export const TRANSITIONS = deepFreeze({
   DRAFT: ['PLANNED'],
   PLANNED: ['READY'],
@@ -61,10 +68,10 @@ export const TRANSITIONS = deepFreeze({
  * @param {string} params.title
  * @param {string} [params.objective='']
  * @param {string[]} [params.acceptanceCriteria=[]]
- * @param {'low'|'normal'|'high'} [params.risk='normal']
+ * @param {'low'|'normal'|'high'|null} [params.risk=null] unset until a host decision
  * @returns {Change}
  */
-export function createChange({ title, objective = '', acceptanceCriteria = [], risk = 'normal' }) {
+export function createChange({ title, objective = '', acceptanceCriteria = [], risk = null }) {
   return new Change({ title, objective, acceptanceCriteria, risk });
 }
 
@@ -79,9 +86,9 @@ export class Change {
    * @param {string} params.title
    * @param {string} [params.objective]
    * @param {string[]} [params.acceptanceCriteria]
-   * @param {'low'|'normal'|'high'} [params.risk]
+   * @param {'low'|'normal'|'high'|null} [params.risk]
    */
-  constructor({ title, objective = '', acceptanceCriteria = [], risk = 'normal' }) {
+  constructor({ title, objective = '', acceptanceCriteria = [], risk = null }) {
     /** @type {string} */
     this.id = crypto.randomUUID();
     /** @type {string} */
@@ -90,7 +97,7 @@ export class Change {
     this.objective = objective;
     /** @type {string[]} */
     this.acceptanceCriteria = acceptanceCriteria;
-    /** @type {'low'|'normal'|'high'} */
+    /** @type {'low'|'normal'|'high'|null} */
     this.risk = risk;
     /** @type {string|null} */
     this.acceptedPlanId = null;

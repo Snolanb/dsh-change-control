@@ -16,7 +16,7 @@ async function fixture(t, policy = {}) {
   const audits = [];
   const store = {
     async listRoleBindings() { return [{ changeId: 'change-1', sessionId: 'worker-1', role: 'worker' }]; },
-    async get() { return { id: 'change-1', state: 'IMPLEMENTING' }; },
+    async get() { return { id: 'change-1', state: 'IMPLEMENTING', risk: 'normal' }; },
     async appendAudit(event) { audits.push(event); },
   };
   const config = { policy: { enabled: true, projectId: 'project-1', owner: 'host', workspaceRoots: [root], ...policy } };
