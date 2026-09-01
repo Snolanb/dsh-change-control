@@ -694,9 +694,10 @@ export class ChangeStore {
 
   /**
    * Accept a PLANNED plan: transition change READY → ACCEPTED (via PLANNED)
-   * and store the acceptedPlanId.
+   * and store the acceptedPlanId. `actor` records the approving host identity
+   * on the audit event for accountability.
    */
-  async acceptPlan(changeId, planId, { authorized = false } = {}) {
+  async acceptPlan(changeId, planId, { authorized = false, actor } = {}) {
     if (!authorized) {
       throw Object.assign(new Error('Not authorized to accept plan'), { code: 'FORBIDDEN' });
     }
@@ -731,6 +732,7 @@ export class ChangeStore {
         to: 'READY',
         ts: c.updatedAt,
         planId,
+        ...(actor !== undefined ? { actor } : {}),
       });
       await this.#persist();
       return structuredClone(currentPlan);
@@ -848,9 +850,10 @@ export class ChangeStore {
   /**
    * Remove a session's role binding from a Change (host/manual unbind).
    * Rejects when the Change or the binding does not exist. Emits an audit
-   * event and deletes the binding durably (removal wins over disk state).
+   * event (recording the acting host identity when provided) and deletes the
+   * binding durably (removal wins over disk state).
    */
-  async unbindRole(changeId, sessionId) {
+  async unbindRole(changeId, sessionId, { actor } = {}) {
     const release = await acquireLock(this.#file);
     try {
       await this.#refreshChange(changeId);
@@ -872,6 +875,7 @@ export class ChangeStore {
         changeId,
         type: 'UNBIND',
         sessionId,
+        ...(actor !== undefined ? { actor } : {}),
         ts: new Date().toISOString(),
       });
       await this.#persist();
@@ -968,8 +972,11 @@ export class ChangeStore {
 
   /**
    * Reload bindings and attempts from disk under lock.
-   * Preserves local uncommitted changes while picking up concurrent writes.
-   * Bindings are synchronized by (changeId, sessionId) - replacing role on rebind.
+   * Bindings are reconciled to the durable disk rows: a binding deleted on
+   * disk disappears locally (deletions propagate like rebinds). Locally dirty
+   * entries and locally removed keys keep their uncommitted values until the
+   * owning write persists.
+   * Attempts are unioned by (attemptId, workerId), preserving local adds.
    */
   async #refreshBindingsAndAttempts() {
     let data;
@@ -979,20 +986,29 @@ export class ChangeStore {
       return;
     }
     if (!data) return;
-    // Reload bindings from disk, sync by (changeId, sessionId)
-    if (data.bindings && Array.isArray(data.bindings)) {
+    // Reconcile bindings to the disk rows.
+    const local = new Map();
+    for (const b of [...this.#bindings.values()].flat()) {
+      local.set(`${b.changeId}:${b.sessionId}`, b);
+    }
+    this.#bindings = new Map();
+    const put = (b) => {
+      if (!this.#bindings.has(b.changeId)) this.#bindings.set(b.changeId, []);
+      this.#bindings.get(b.changeId).push({ changeId: b.changeId, sessionId: b.sessionId, role: b.role });
+    };
+    if (Array.isArray(data.bindings)) {
       for (const b of data.bindings) {
-        if (!this.#bindings.has(b.changeId)) this.#bindings.set(b.changeId, []);
-        const changeBindings = this.#bindings.get(b.changeId);
-        const existingIdx = changeBindings.findIndex((eb) => eb.sessionId === b.sessionId);
-        if (existingIdx >= 0) {
-          // Replace existing binding (handles rebind case)
-          changeBindings[existingIdx] = { changeId: b.changeId, sessionId: b.sessionId, role: b.role };
-        } else {
-          // Add new binding
-          changeBindings.push({ changeId: b.changeId, sessionId: b.sessionId, role: b.role });
-        }
+        const key = `${b.changeId}:${b.sessionId}`;
+        if (this.#removedBindings.has(key)) continue; // locally removed: deletion wins
+        const localEntry = local.get(key);
+        // A dirty local entry (fresh rebind) wins over the stale disk row.
+        put(localEntry && this.#dirtyBindings.has(key) ? localEntry : b);
+        local.delete(key);
       }
+    }
+    // Dirty local bindings not yet on disk survive the refresh.
+    for (const [key, b] of local) {
+      if (this.#dirtyBindings.has(key)) put(b);
     }
     // Reload attempts from disk
     if (data.attempts && Array.isArray(data.attempts)) {

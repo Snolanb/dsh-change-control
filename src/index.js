@@ -63,11 +63,16 @@ async function apply(ctx, config) {
 
   // Register host-side manual /change-* commands when the host exposes a
   // commands service (absent in tool-only compositions; the model-facing tools
-  // stay authoritative there).
+  // stay authoritative there). 'commands' is intentionally not in the inject
+  // list: cordis would block plugin startup on hosts without it. Instead, a
+  // host that advertises commands must accept them — a malformed or failing
+  // commands.register throws loudly rather than silently registering nothing.
+  // The returned disposers are retained and released on teardown.
   let commands;
   try { commands = ctx.commands; } catch { commands = null; }
-  if (commands && typeof commands.register === 'function') {
-    registerChangeCommands(commands, store);
+  let commandDisposers = [];
+  if (commands) {
+    commandDisposers = registerChangeCommands(commands, store);
   }
 
   // Wire up the filesystem/tool policy pre-execute interceptor.
@@ -81,7 +86,11 @@ async function apply(ctx, config) {
   ctx.effect(() => {
     // Initialization logic runs exactly once per context
     return () => {
-      // Cleanup logic - releases all owned resources
+      // Release the host command registrations on plugin teardown.
+      for (const dispose of commandDisposers) {
+        try { if (typeof dispose === 'function') dispose(); } catch { /* teardown best-effort */ }
+      }
+      commandDisposers = [];
     };
   });
 }
