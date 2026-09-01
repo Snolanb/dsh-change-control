@@ -1,4 +1,7 @@
 // @ts-nocheck
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { realpath } from 'node:fs/promises';
+
 /**
  * Deterministic filesystem and tool policy enforcement.
  *
@@ -50,6 +53,20 @@ export function createFilesystemPolicy(store, config) {
   async function policyGate(exec, next) {
     const agentId = exec?.agent?.id;
     if (!agentId) return next();
+
+    // Host-owned governance layer: active only when the policy names a
+    // governed project. Runs before role/change-tool pass-through so that
+    // repository content can never bypass authoritative checks.
+    if (policyConfig.projectId) {
+      const decision = await evaluateGovernance(policyConfig, exec);
+      await auditGovernance(store, exec, agentId, decision, policyConfig);
+      if (decision) {
+        // Escalation surfaces at the host boundary as an 'ask' — the human
+        // approval channel — while the audit record keeps the internal code.
+        if (decision.kind === 'escalate') return { kind: 'ask', reason: decision.reason };
+        return decision;
+      }
+    }
 
     // Determine target change from tool arguments when available.
     const requestedChangeId = exec?.arguments?.changeId ?? null;
@@ -112,6 +129,236 @@ export function createFilesystemPolicy(store, config) {
   }
 
   return policyGate;
+}
+
+// ─── Governance helpers ─────────────────────────────────────────────────────
+
+/** Whether this platform's filesystem compares paths case-insensitively. */
+const CASE_INSENSITIVE = process.platform === 'darwin' || process.platform === 'win32';
+const fold = (p) => (CASE_INSENSITIVE ? p.toLowerCase() : p);
+
+/** Argument keys carrying a single path (string) or a list of paths. */
+const PATH_KEYS = ['path', 'file_path'];
+const PATH_LIST_KEYS = ['paths', 'files'];
+
+function extractPaths(args) {
+  const out = [];
+  for (const key of PATH_KEYS) if (typeof args?.[key] === 'string') out.push(args[key]);
+  for (const key of PATH_LIST_KEYS) {
+    if (Array.isArray(args?.[key])) {
+      for (const value of args[key]) if (typeof value === 'string') out.push(value);
+    }
+  }
+  return out;
+}
+
+/** Canonical check name, matching ChangeStore/PreflightRunner normalization. */
+const checkName = (entry) => (typeof entry === 'string' ? entry : entry?.name);
+
+/**
+ * Recursively find required-checks payloads anywhere in tool arguments
+ * (top-level, content-nested, alternate key spellings).
+ * ponytail: depth-capped recursion; model arguments are JSON — acyclic.
+ */
+function findCheckAttempts(value, depth = 0) {
+  if (depth > 8 || value === null || typeof value !== 'object') return [];
+  const found = [];
+  if (Array.isArray(value)) {
+    for (const item of value) found.push(...findCheckAttempts(item, depth + 1));
+    return found;
+  }
+  for (const [key, nested] of Object.entries(value)) {
+    const normalized = key.toLowerCase();
+    if ((normalized === 'requiredchecks' || normalized === 'required_checks') && Array.isArray(nested)) {
+      found.push(nested);
+    } else {
+      found.push(...findCheckAttempts(nested, depth + 1));
+    }
+  }
+  return found;
+}
+
+/**
+ * Resolve symlinks. Fail-closed for non-existent leaves: walk up to the
+ * nearest existing ancestor and re-anchor the remaining segments there.
+ */
+async function canonicalize(path) {
+  const resolved = resolve(path);
+  try {
+    return await realpath(resolved);
+  } catch {
+    let dir = dirname(resolved);
+    let rest = basename(resolved);
+    while (true) {
+      try {
+        return join(await realpath(dir), rest);
+      } catch {
+        const up = dirname(dir);
+        if (up === dir) return resolved;
+        rest = join(basename(dir), rest);
+        dir = up;
+      }
+    }
+  }
+}
+
+/** Path === base or path nests under base (case-folded where applicable). */
+function isWithin(canon, base) {
+  const c = fold(canon);
+  const b = fold(base);
+  return c === b || c.startsWith(b + sep);
+}
+
+/**
+ * Canonicalize a protected entry: absolute entries as-is, relative entries
+ * against each workspace root. Returns the list of canonical protected bases.
+ */
+async function canonProtectedEntries(entries, canonRoots) {
+  const out = [];
+  for (const entry of entries) {
+    if (typeof entry !== 'string' || entry.length === 0) continue;
+    if (isAbsolute(entry)) {
+      out.push(await canonicalize(entry));
+    } else {
+      for (const root of canonRoots) out.push(await canonicalize(join(root, entry)));
+    }
+  }
+  return out;
+}
+
+/**
+ * Protected-entry match. A protected entry protects itself and everything
+ * beneath it. With roots, entries match canonically; without roots, relative
+ * entries fall back to a path-suffix match.
+ */
+function isProtected(canon, canonProtected, entries, hasRoots) {
+  if (canonProtected.some((base) => isWithin(canon, base))) return true;
+  if (!hasRoots) {
+    const foldedCanon = fold(canon);
+    for (const entry of entries) {
+      if (typeof entry !== 'string' || entry.length === 0 || isAbsolute(entry)) continue;
+      const suffix = fold(resolve(sep, entry).slice(1));
+      if (foldedCanon === suffix || foldedCanon.endsWith(sep + suffix)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Governance evaluation. Returns null when the call is allowed, or a
+ * decision { kind: 'deny' | 'escalate', reason, code } to short-circuit it.
+ * Deterministic apart from the fs realpath step: same fs + inputs yield the
+ * same decision.
+ */
+async function evaluateGovernance(policy, exec) {
+  // Fail closed: a governed policy must be explicitly host-owned.
+  if (policy.owner !== 'host') {
+    return deny('OWNER_NOT_HOST', 'Governance policy must be explicitly host-owned');
+  }
+
+  const args = exec?.arguments ?? {};
+
+  // The governed project comes from host-owned config, not model arguments;
+  // only an explicitly supplied conflicting projectId is a mismatch.
+  const requestedProject = args.projectId ?? null;
+  if (requestedProject !== null && requestedProject !== policy.projectId) {
+    return deny('PROJECT_MISMATCH', `Action targets project "${requestedProject}", not governed project "${policy.projectId}"`);
+  }
+
+  // AC2/AC6: repository or call-site content cannot remove host-required checks.
+  const required = (Array.isArray(policy.requiredChecks) ? policy.requiredChecks : [])
+    .map(checkName).filter(Boolean);
+  if (required.length > 0) {
+    for (const attempt of findCheckAttempts(args)) {
+      const names = attempt.map(checkName).filter(Boolean);
+      const missing = required.filter((name) => !names.includes(name));
+      if (missing.length > 0) {
+        return deny('REQUIRED_CHECKS_REMOVED', `Cannot remove host-required checks: ${missing.join(', ')}`);
+      }
+    }
+  }
+
+  const paths = extractPaths(args);
+
+  // Command-bearing tools with no extractable path (bash and similar) fail
+  // closed under a governed project — their mutation surface is unbounded.
+  if (paths.length === 0 && typeof args.command === 'string') {
+    return deny('COMMAND_NOT_CONSTRAINABLE', `Tool "${exec.name}" carries a command with no constrainable path; denied under governed project`);
+  }
+
+  if (paths.length === 0) return null;
+
+  const roots = Array.isArray(policy.workspaceRoots) ? policy.workspaceRoots : [];
+  const canonRoots = [];
+  for (const root of roots) canonRoots.push(await canonicalize(root));
+  const protectedPaths = Array.isArray(policy.protectedPaths) ? policy.protectedPaths : [];
+  const canonProtected = await canonProtectedEntries(protectedPaths, canonRoots);
+
+  for (const path of paths) {
+    const canon = await canonicalize(path);
+    if (canonRoots.length > 0 && !canonRoots.some((base) => isWithin(canon, base))) {
+      return deny('OUTSIDE_WORKSPACE_ROOTS', `Path is outside permitted workspace roots: ${path}`);
+    }
+    if (protectedPaths.length > 0 && isProtected(canon, canonProtected, protectedPaths, canonRoots.length > 0)) {
+      if (policy.protectedPathPolicy === 'escalate') {
+        return escalate('PROTECTED_PATH', `Protected path requires human escalation: ${path}`);
+      }
+      return deny('PROTECTED_PATH', `Protected path is denied: ${path}`);
+    }
+  }
+
+  return null;
+}
+
+function deny(code, reason) {
+  return { kind: 'deny', reason, code };
+}
+
+function escalate(code, reason) {
+  return { kind: 'escalate', reason, code };
+}
+
+/** Tracks the last audited policy version per gate instance (closure key). */
+const lastAuditedVersion = new WeakMap();
+
+/**
+ * Audit governance activity for a governed execution with the governing
+ * policy version (AC5): one record per governed execution (allow/deny/
+ * escalate), plus a POLICY_VERSION event when the governing version changes.
+ * The store assigns eventIds (integer, strictly increasing); metadata only.
+ */
+async function auditGovernance(store, exec, sessionId, decision, policy) {
+  const version = policy.policyVersion ?? policy.version ?? null;
+  try {
+    const toolName = exec?.name;
+    if (lastAuditedVersion.get(store) !== undefined && lastAuditedVersion.get(store) !== version) {
+      await store.appendAudit({
+        changeId: exec?.arguments?.changeId ?? null,
+        projectId: policy.projectId,
+        type: 'POLICY_VERSION',
+        role: 'governance',
+        toolName,
+        sessionId,
+        from: lastAuditedVersion.get(store),
+        to: version,
+        ts: new Date().toISOString(),
+      });
+    }
+    lastAuditedVersion.set(store, version);
+    await store.appendAudit({
+      changeId: exec?.arguments?.changeId ?? null,
+      projectId: policy.projectId,
+      type: decision ? (decision.kind === 'escalate' ? 'ESCALATION' : 'DENIAL') : 'GOVERNANCE_ALLOW',
+      role: 'governance',
+      toolName,
+      sessionId,
+      reason: decision?.code ?? 'ALLOWED',
+      policyVersion: version,
+      ts: new Date().toISOString(),
+    });
+  } catch {
+    // Non-fatal: audit failures must not break tool execution flow
+  }
 }
 
 /**

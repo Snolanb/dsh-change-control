@@ -892,7 +892,9 @@ export class ChangeStore {
     const release = await acquireLock(this.#file);
     try {
       await reseedFromDisk(this.#file);
-      this.#audit.push(event);
+      // Store-owned sequencing: audit eventIds always come from nextEventId()
+      // so persisted ids are integers, strictly increasing, and collision-free.
+      this.#audit.push({ ...event, eventId: nextEventId() });
       await this.#persist();
     } finally {
       release();
