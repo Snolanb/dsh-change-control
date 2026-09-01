@@ -31,7 +31,61 @@ async function resolveBinding(store, sessionId, changeId) {
   const binding = bindings.find((b) => b.sessionId === sessionId && b.changeId === changeId);
   if (!binding) return null;
   const change = await store.get(binding.changeId);
-  return { changeId: binding.changeId, role: binding.role, state: change.state };
+  return { changeId: binding.changeId, role: binding.role, state: change.state, risk: change.risk, hasRisk: 'risk' in change };
+}
+
+/** Host-effective risk levels, weakest to strongest. */
+const RISK_ORDER = { low: 0, normal: 1, high: 2 };
+
+/**
+ * Risk-profile enforcement for a bound session. Returns a deny decision or
+ * null. Effective risk always comes from the host store (change.risk) —
+ * never from model-supplied arguments — and is case-normalized.
+ * - AC1: risk must be explicit before implementation proceeds.
+ * - AC2/AC5: model args may not claim a weaker risk than the host value;
+ *   a prior weaker-risk satisfaction therefore never authorizes the change.
+ * - AC3: configured per-risk requiredChecks gates are enforced on change
+ *   tool submissions.
+ * - AC4: human-controlled gates (checks named *human*) under high risk
+ *   cannot be satisfied by any model-facing tool.
+ */
+function evaluateRisk(policyConfig, binding, exec) {
+  // Legacy store paths carrying no risk field are outside risk governance;
+  // every real Change always carries a host-set risk value.
+  if (!binding.hasRisk) return null;
+  const hostRisk = typeof binding.risk === 'string' ? binding.risk.toLowerCase() : null;
+  if (!hostRisk || !(hostRisk in RISK_ORDER)) {
+    return deny('RISK_NOT_EXPLICIT', `Change ${binding.changeId} has no explicit effective risk; implementation cannot proceed`);
+  }
+  const args = exec?.arguments ?? {};
+  for (const key of ['risk', 'effectiveRisk']) {
+    const claimed = args[key];
+    if (typeof claimed === 'string' && claimed.toLowerCase() in RISK_ORDER
+        && RISK_ORDER[claimed.toLowerCase()] < RISK_ORDER[hostRisk]) {
+      return deny('RISK_REDUCTION', `Agent session cannot reduce risk: host effective risk is ${hostRisk}, not ${claimed}`);
+    }
+  }
+  if (!CHANGE_TOOL_NAMES.has(exec.name)) return null;
+  const profiles = policyConfig.riskProfiles;
+  // Keys normalize case-insensitively; the contract spells them low/normal/high.
+  const profile = profiles && typeof profiles === 'object'
+    ? profiles[hostRisk] ?? profiles[hostRisk.toUpperCase()]
+    : null;
+  const required = (Array.isArray(profile?.requiredChecks) ? profile.requiredChecks : [])
+    .map(checkName).filter(Boolean);
+  if (required.length === 0) return null;
+  const humanControlled = required.filter((c) => /human/i.test(c));
+  for (const attempt of findCheckAttempts(args)) {
+    const names = attempt.map(checkName).filter(Boolean);
+    if (hostRisk === 'high' && humanControlled.some((hc) => names.includes(hc))) {
+      return deny('HUMAN_GATE_BYPASS', 'High-risk human-controlled gates cannot be satisfied by model-facing tools');
+    }
+    const missing = required.filter((name) => !names.includes(name));
+    if (missing.length > 0) {
+      return deny('RISK_GATE_INCOMPLETE', `${hostRisk.toUpperCase()} risk requires all configured gates; missing: ${missing.join(', ')}`);
+    }
+  }
+  return null;
 }
 
 /**
@@ -108,6 +162,14 @@ export function createFilesystemPolicy(store, config) {
     if (!binding) return next();
 
     const { changeId, role, state } = binding;
+
+    // Host-owned risk-profile gate: effective risk and gates are derived from
+    // the store and policy config, never from model-supplied arguments.
+    const riskDecision = evaluateRisk(policyConfig, binding, exec);
+    if (riskDecision) {
+      await auditDenial(store, changeId, exec, agentId, role, state, riskDecision.code);
+      return riskDecision;
+    }
 
     // Allow change-control tools through — they have their own authorization layer.
     if (CHANGE_TOOL_NAMES.has(exec.name)) return next();
