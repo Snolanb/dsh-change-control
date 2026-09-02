@@ -31,6 +31,7 @@ test('loads a valid profile and registers exactly one initialization hook', asyn
   const c = new Context();
   await c.plugin(SystemPrompt);
   await c.plugin(ToolRuntime);
+  c.provide('commands', { register: () => () => {} });
   const fiber = await c.plugin(plugin);
   assert.equal(fiber.state, 2 /* ACTIVE */);
   const effects = fiber.getEffects();
@@ -47,6 +48,7 @@ test('shutdown releases every resource owned by the plugin', async (ctx) => {
   const c = new Context();
   await c.plugin(SystemPrompt);
   await c.plugin(ToolRuntime);
+  c.provide('commands', { register: () => () => {} });
   const fiber = await c.plugin(plugin);
   assert.equal(fiber.state, 2 /* ACTIVE */);
   await assert.doesNotReject(async () => await fiber.dispose());

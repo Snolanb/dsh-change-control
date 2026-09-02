@@ -98,5 +98,5 @@ async function apply(ctx, config) {
 export { name, apply };
 
 /** @type {object} Plugin descriptor with injection requirements. */
-const plugin = { name, apply, inject: ['tools'] };
+const plugin = { name, apply, inject: ['tools', 'commands'] };
 export default plugin;
