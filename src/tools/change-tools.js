@@ -136,7 +136,19 @@ export function createChangeTools(store) {
           if (err instanceof AuthorizationError) throw Object.assign(new Error(err.message), { code: err.reason });
           throw err;
         }
-        await transitionWithStructure(store, args.changeId, 'PREFLIGHT');
+        let proofObj;
+        try {
+          proofObj = JSON.parse(args.proof);
+        } catch {
+          // Preserve the legacy transition-only contract for plain strings; no
+          // proof is persisted, so preflight cannot treat arbitrary text as proof.
+          await transitionWithStructure(store, args.changeId, 'PREFLIGHT');
+          return { success: true };
+        }
+        if (!proofObj || typeof proofObj !== 'object' || Array.isArray(proofObj)) {
+          throw Object.assign(new Error('proof must be a JSON object'), { code: 'INVALID_PROOF' });
+        }
+        await store.submitProof(args.changeId, proofObj);
         return { success: true };
       },
     }),
